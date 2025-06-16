@@ -37,12 +37,35 @@ def parse_arguments():
     
     # 数据集设置
     parser.add_argument('--dataset-type', default='modelnet', 
-                        choices=['modelnet', 'shapenet2', 'kitti', '3dmatch'],
+                        choices=['modelnet', 'shapenet2', 'kitti', '3dmatch', 'c3vd'],
                         help='数据集类型')
     parser.add_argument('--num-points', default=1024, type=int,
                         help='点云中的点数')
     parser.add_argument('--categoryfile', default='', type=str,
                         help='类别文件路径（ModelNet需要）')
+    
+    # C3VD数据集特定参数
+    parser.add_argument('--c3vd-source-root', default='', type=str,
+                        help='C3VD源点云根目录路径')
+    parser.add_argument('--c3vd-target-root', default='', type=str,
+                        help='C3VD目标点云根目录路径（可选）')
+    parser.add_argument('--c3vd-pairing-strategy', default='one_to_one',
+                        choices=['one_to_one', 'scene_reference', 'source_to_source', 'target_to_target', 'all'],
+                        help='C3VD配对策略')
+    parser.add_argument('--c3vd-transform-mag', default=0.8, type=float,
+                        help='C3VD Ground Truth变换幅度')
+    
+    # 体素化参数
+    parser.add_argument('--voxel-size', default=0.05, type=float,
+                        help='体素大小')
+    parser.add_argument('--voxel-grid-size', default=32, type=int,
+                        help='体素网格大小')
+    parser.add_argument('--max-voxel-points', default=100, type=int,
+                        help='每个体素最大点数')
+    parser.add_argument('--max-voxels', default=20000, type=int,
+                        help='最大体素数量')
+    parser.add_argument('--min-voxel-points-ratio', default=0.1, type=float,
+                        help='最小体素点数比例')
     
     # 模型设置
     parser.add_argument('--dim-k', default=1024, type=int,
@@ -155,6 +178,10 @@ class UnifiedTrainer:
         """创建数据加载器"""
         LOGGER.info(f"创建 {self.args.dataset_type} 数据加载器...")
         
+        # C3VD数据集特殊处理
+        if self.args.dataset_type == 'c3vd':
+            return self._create_c3vd_data_loaders()
+        
         # 根据模型类型选择数据源
         data_source = 'original' if self.args.model_type == 'original' else 'improved'
         
@@ -191,6 +218,82 @@ class UnifiedTrainer:
         )
         
         LOGGER.info(f"训练集大小: {len(trainset)}, 测试集大小: {len(testset)}")
+        return train_loader, test_loader
+    
+    def _create_c3vd_data_loaders(self):
+        """创建C3VD数据加载器"""
+        from data_utils import create_c3vd_dataset
+        
+        LOGGER.info("创建C3VD数据集...")
+        
+        # 确定数据路径
+        source_root = self.args.c3vd_source_root or self.args.dataset_path
+        target_root = self.args.c3vd_target_root or source_root
+        
+        # 体素化配置
+        voxel_config = {
+            'voxel_size': self.args.voxel_size,
+            'voxel_grid_size': self.args.voxel_grid_size,
+            'max_voxel_points': self.args.max_voxel_points,
+            'max_voxels': self.args.max_voxels,
+            'min_voxel_points_ratio': self.args.min_voxel_points_ratio
+        }
+        
+        # 智能采样配置
+        sampling_config = {
+            'target_points': self.args.num_points,
+            'intersection_priority': True,
+            'min_intersection_ratio': 0.3,
+            'max_intersection_ratio': 0.7
+        }
+        
+        # 创建训练集
+        trainset = create_c3vd_dataset(
+            source_root=source_root,
+            target_root=target_root,
+            pairing_strategy=self.args.c3vd_pairing_strategy,
+            mag=self.args.c3vd_transform_mag,
+            train=True,
+            vis=False,
+            voxel_config=voxel_config,
+            sampling_config=sampling_config
+        )
+        
+        # 创建测试集（使用较小的变换幅度）
+        testset = create_c3vd_dataset(
+            source_root=source_root,
+            target_root=target_root,
+            pairing_strategy='one_to_one',  # 测试时使用简单配对
+            mag=self.args.c3vd_transform_mag * 0.5,  # 测试时使用较小变换
+            train=False,
+            vis=False,
+            voxel_config=voxel_config,
+            sampling_config=sampling_config
+        )
+        
+        # 创建数据加载器
+        train_loader = torch.utils.data.DataLoader(
+            trainset,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        test_loader = torch.utils.data.DataLoader(
+            testset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        LOGGER.info(f"C3VD训练集大小: {len(trainset)}, 测试集大小: {len(testset)}")
+        LOGGER.info(f"配对策略: {self.args.c3vd_pairing_strategy}, 变换幅度: {self.args.c3vd_transform_mag}")
+        LOGGER.info(f"体素化配置: 网格大小={self.args.voxel_grid_size}, 体素大小={self.args.voxel_size}")
+        
         return train_loader, test_loader
     
     def _create_optimizer(self):
@@ -303,8 +406,14 @@ class UnifiedTrainer:
     
     def _parse_batch_data(self, data):
         """解析批次数据（适配不同的数据格式）"""
-        # 这里需要根据实际的数据格式进行适配
-        # 暂时返回默认格式
+        # C3VD数据集返回字典格式
+        if isinstance(data, dict):
+            p0 = data['source']
+            p1 = data['target'] 
+            igt = data['igt']
+            return p0, p1, igt
+        
+        # 其他数据集的格式
         if isinstance(data, (list, tuple)) and len(data) >= 2:
             p0, p1 = data[0], data[1]
             # 生成随机变换作为真实值（用于训练）

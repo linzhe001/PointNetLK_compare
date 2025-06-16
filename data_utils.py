@@ -273,11 +273,12 @@ class RandomTransformSE3:
         self.gt = gt   # p1 --> p0
         self.igt = g   # p0 --> p1
         
-        return p1
+        return p1, g.squeeze(0)  # 返回变换后的点云和变换矩阵
 
     def transform(self, tensor):
         x = self.generate_transform()
-        return self.apply_transform(tensor, x)
+        p1, igt = self.apply_transform(tensor, x)
+        return p1
 
     def __call__(self, tensor):
         return self.transform(tensor)
@@ -845,3 +846,689 @@ class Resampler:
             out[selected:(selected + sel)] = val
             selected += sel
         return out
+
+
+class C3VDDataset(torch.utils.data.Dataset):
+    """
+    C3VD医学点云数据集，支持体素化和智能采样
+    基于addc3vd.mdc文档的完整实现
+    """
+    
+    def __init__(self, source_root, target_root=None, pairing_strategy='one_to_one',
+                 voxel_config=None, sampling_config=None, transform=None, 
+                 train=True, vis=False):
+        """
+        初始化C3VD数据集
+        
+        Args:
+            source_root: 源点云根目录路径
+            target_root: 目标点云根目录路径（可选，默认与source_root相同）
+            pairing_strategy: 配对策略 ('one_to_one', 'scene_reference', 'source_to_source', 'target_to_target', 'all')
+            voxel_config: 体素化配置参数
+            sampling_config: 智能采样配置参数
+            transform: Ground Truth变换（训练时使用）
+            train: 是否为训练模式
+            vis: 是否返回可视化数据
+        """
+        super().__init__()
+        self.source_root = source_root
+        self.target_root = target_root or source_root
+        self.pairing_strategy = pairing_strategy
+        self.transform = transform
+        self.train = train
+        self.vis = vis
+        
+        # 体素化配置（C3VD推荐配置）
+        self.voxel_config = voxel_config or {
+            'voxel_size': 0.05,
+            'voxel_grid_size': 32,
+            'max_voxel_points': 100,
+            'max_voxels': 20000,
+            'min_voxel_points_ratio': 0.1
+        }
+        
+        # 智能采样配置
+        self.sampling_config = sampling_config or {
+            'target_points': 1024,
+            'intersection_priority': True,
+            'min_intersection_ratio': 0.3,
+            'max_intersection_ratio': 0.7
+        }
+        
+        # 解剖区域映射
+        self.anatomy_classes = {
+            'cecum': 1,
+            'desc': 2, 
+            'sigmoid': 3,
+            'trans': 4
+        }
+        
+        # 加载数据对列表
+        self.pairs = self._load_pairs()
+        print(f"✅ C3VD数据集加载完成: {len(self.pairs)}个点云对")
+    
+    def _load_pairs(self):
+        """根据配对策略加载点云对列表"""
+        pairs = []
+        
+        # 扫描源目录获取所有场景
+        source_scenes = self._scan_scenes(self.source_root)
+        target_scenes = self._scan_scenes(self.target_root)
+        
+        if self.pairing_strategy == 'one_to_one':
+            pairs = self._create_one_to_one_pairs(source_scenes, target_scenes)
+        elif self.pairing_strategy == 'scene_reference':
+            pairs = self._create_scene_reference_pairs(source_scenes, target_scenes)
+        elif self.pairing_strategy == 'source_to_source':
+            pairs = self._create_source_to_source_pairs(source_scenes)
+        elif self.pairing_strategy == 'target_to_target':
+            pairs = self._create_target_to_target_pairs(target_scenes)
+        elif self.pairing_strategy == 'all':
+            pairs.extend(self._create_one_to_one_pairs(source_scenes, target_scenes))
+            pairs.extend(self._create_source_to_source_pairs(source_scenes))
+            pairs.extend(self._create_target_to_target_pairs(target_scenes))
+        else:
+            raise ValueError(f"不支持的配对策略: {self.pairing_strategy}")
+        
+        return pairs
+    
+    def _scan_scenes(self, root_path):
+        """扫描目录获取所有场景和对应的PLY文件"""
+        scenes = {}
+        
+        if not os.path.exists(root_path):
+            print(f"警告: 路径不存在 {root_path}")
+            return scenes
+            
+        for scene_dir in os.listdir(root_path):
+            scene_path = os.path.join(root_path, scene_dir)
+            if not os.path.isdir(scene_path):
+                continue
+                
+            # 解析场景名称 (anatomy_trial_sequence)
+            parts = scene_dir.split('_')
+            if len(parts) >= 3:
+                anatomy = parts[0]
+                trial = parts[1] 
+                sequence = parts[2]
+                
+                # 查找PLY文件
+                ply_files = []
+                for file_name in os.listdir(scene_path):
+                    if file_name.endswith('.ply'):
+                        ply_files.append(os.path.join(scene_path, file_name))
+                
+                if ply_files:
+                    scenes[scene_dir] = {
+                        'anatomy': anatomy,
+                        'trial': trial,
+                        'sequence': sequence,
+                        'files': sorted(ply_files),
+                        'class_id': self.anatomy_classes.get(anatomy, 0)
+                    }
+        
+        return scenes
+    
+    def _create_one_to_one_pairs(self, source_scenes, target_scenes):
+        """创建一对一配对"""
+        pairs = []
+        
+        for scene_name in source_scenes:
+            if scene_name in target_scenes:
+                source_files = source_scenes[scene_name]['files']
+                target_files = target_scenes[scene_name]['files']
+                
+                # 配对同一场景的文件
+                min_len = min(len(source_files), len(target_files))
+                for i in range(min_len):
+                    pairs.append({
+                        'source': source_files[i],
+                        'target': target_files[i],
+                        'scene': scene_name,
+                        'anatomy': source_scenes[scene_name]['anatomy'],
+                        'class_id': source_scenes[scene_name]['class_id']
+                    })
+        
+        return pairs
+    
+    def _create_scene_reference_pairs(self, source_scenes, target_scenes):
+        """创建场景参考配对（每个场景使用一个共享目标）"""
+        pairs = []
+        
+        for scene_name in source_scenes:
+            if scene_name in target_scenes:
+                source_files = source_scenes[scene_name]['files']
+                target_files = target_scenes[scene_name]['files']
+                
+                if target_files:
+                    # 使用第一个目标文件作为参考
+                    reference_target = target_files[0]
+                    
+                    for source_file in source_files:
+                        pairs.append({
+                            'source': source_file,
+                            'target': reference_target,
+                            'scene': scene_name,
+                            'anatomy': source_scenes[scene_name]['anatomy'],
+                            'class_id': source_scenes[scene_name]['class_id']
+                        })
+        
+        return pairs
+    
+    def _create_source_to_source_pairs(self, source_scenes):
+        """创建源到源配对（数据增强）"""
+        pairs = []
+        
+        for scene_name, scene_info in source_scenes.items():
+            files = scene_info['files']
+            
+            # 创建同一场景内的文件配对
+            for i in range(len(files)):
+                for j in range(i + 1, len(files)):
+                    pairs.append({
+                        'source': files[i],
+                        'target': files[j],
+                        'scene': scene_name,
+                        'anatomy': scene_info['anatomy'],
+                        'class_id': scene_info['class_id']
+                    })
+        
+        return pairs
+    
+    def _create_target_to_target_pairs(self, target_scenes):
+        """创建目标到目标配对（数据增强）"""
+        return self._create_source_to_source_pairs(target_scenes)
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def _load_ply_file(self, file_path):
+        """加载PLY文件并返回点云数据"""
+        try:
+            # 使用Open3D加载PLY文件
+            pcd = o3d.io.read_point_cloud(file_path)
+            points = np.asarray(pcd.points)
+            
+            if len(points) == 0:
+                print(f"警告: PLY文件为空 {file_path}")
+                return np.array([]).reshape(0, 3)
+            
+            return points.astype(np.float32)
+            
+        except Exception as e:
+            print(f"错误: 无法加载PLY文件 {file_path}: {e}")
+            return np.array([]).reshape(0, 3)
+    
+    def _apply_ground_truth_transform(self, target_points):
+        """应用Ground Truth变换"""
+        if self.transform is None:
+            return target_points, np.eye(4)
+        
+        # 转换为torch tensor
+        target_tensor = torch.from_numpy(target_points).float()
+        
+        # 应用变换
+        if hasattr(self.transform, 'apply_transform'):
+            # 使用RandomTransformSE3的apply_transform方法
+            x = self.transform.generate_transform()
+            transformed_tensor, igt = self.transform.apply_transform(target_tensor, x)
+            return transformed_tensor.numpy(), igt.numpy()
+        else:
+            # 直接调用transform
+            transformed_tensor = self.transform(target_tensor)
+            return transformed_tensor.numpy(), np.eye(4)
+    
+    def _voxelize_point_clouds(self, source_points, target_points):
+        """
+        对点云对进行体素化处理
+        实现addc3vd.mdc中描述的体素化流程
+        """
+        try:
+            # 1. 寻找重叠区域并计算体素网格参数
+            source_overlap, target_overlap, xmin, ymin, zmin, xmax, ymax, zmax, vx, vy, vz = \
+                find_voxel_overlaps(source_points, target_points, self.voxel_config['voxel_grid_size'])
+            
+            if len(source_overlap) == 0 or len(target_overlap) == 0:
+                print("警告: 点云无重叠区域，回退到原始点云")
+                return source_points, target_points, np.array([])
+            
+            # 2. 体素化转换
+            coords_range = (xmin, ymin, zmin, xmax, ymax, zmax)
+            voxel_size = (vx, vy, vz)
+            
+            # 对源点云体素化
+            source_voxels, source_coords, source_num_points = points_to_voxel_second(
+                source_overlap, coords_range, voxel_size,
+                max_points=self.voxel_config['max_voxel_points'],
+                max_voxels=self.voxel_config['max_voxels']
+            )
+            
+            # 对目标点云体素化
+            target_voxels, target_coords, target_num_points = points_to_voxel_second(
+                target_overlap, coords_range, voxel_size,
+                max_points=self.voxel_config['max_voxel_points'],
+                max_voxels=self.voxel_config['max_voxels']
+            )
+            
+            # 3. 体素筛选和交集计算
+            intersection_indices = self._compute_voxel_intersection(
+                source_coords, target_coords, source_num_points, target_num_points
+            )
+            
+            # 4. 智能采样策略
+            final_source, final_target = self._smart_sampling_strategy(
+                source_voxels, target_voxels, source_coords, target_coords,
+                intersection_indices, source_num_points, target_num_points
+            )
+            
+            return final_source, final_target, intersection_indices
+            
+        except Exception as e:
+            print(f"体素化处理失败: {e}")
+            print("回退到随机采样策略")
+            return self._fallback_random_sampling(source_points, target_points)
+    
+    def _compute_voxel_intersection(self, source_coords, target_coords, 
+                                   source_num_points, target_num_points):
+        """计算体素交集"""
+        # 基于点密度筛选有效体素
+        min_points_threshold = int(self.voxel_config['min_voxel_points_ratio'] * 
+                                 self.voxel_config['max_voxel_points'])
+        
+        # 筛选有效体素
+        valid_source_mask = source_num_points >= min_points_threshold
+        valid_target_mask = target_num_points >= min_points_threshold
+        
+        # 计算体素索引
+        grid_size = self.voxel_config['voxel_grid_size']
+        source_indices = (source_coords[:, 1] * (grid_size**2) + 
+                         source_coords[:, 0] * grid_size + 
+                         source_coords[:, 2])
+        target_indices = (target_coords[:, 1] * (grid_size**2) + 
+                         target_coords[:, 0] * grid_size + 
+                         target_coords[:, 2])
+        
+        # 获取有效体素的索引
+        valid_source_indices = source_indices[valid_source_mask]
+        valid_target_indices = target_indices[valid_target_mask]
+        
+        # 计算交集
+        intersection_indices, source_intersect_idx, target_intersect_idx = np.intersect1d(
+            valid_source_indices, valid_target_indices, 
+            assume_unique=True, return_indices=True
+        )
+        
+        return intersection_indices
+    
+    def _smart_sampling_strategy(self, source_voxels, target_voxels, 
+                               source_coords, target_coords, intersection_indices,
+                               source_num_points, target_num_points):
+        """
+        智能采样策略：优先保留交集体素，其余随机采样
+        实现addc3vd.mdc中描述的智能采样算法
+        """
+        target_points = self.sampling_config['target_points']
+        
+        # 1. 提取交集体素的点
+        intersection_source_points = []
+        intersection_target_points = []
+        
+        if len(intersection_indices) > 0:
+            # 找到交集体素在原始体素数组中的位置
+            grid_size = self.voxel_config['voxel_grid_size']
+            source_indices = (source_coords[:, 1] * (grid_size**2) + 
+                             source_coords[:, 0] * grid_size + 
+                             source_coords[:, 2])
+            target_indices = (target_coords[:, 1] * (grid_size**2) + 
+                             target_coords[:, 0] * grid_size + 
+                             target_coords[:, 2])
+            
+            for intersection_idx in intersection_indices:
+                # 找到对应的体素
+                source_voxel_mask = source_indices == intersection_idx
+                target_voxel_mask = target_indices == intersection_idx
+                
+                if np.any(source_voxel_mask):
+                    source_voxel_idx = np.where(source_voxel_mask)[0][0]
+                    voxel_points = source_voxels[source_voxel_idx]
+                    num_points = source_num_points[source_voxel_idx]
+                    intersection_source_points.append(voxel_points[:num_points])
+                
+                if np.any(target_voxel_mask):
+                    target_voxel_idx = np.where(target_voxel_mask)[0][0]
+                    voxel_points = target_voxels[target_voxel_idx]
+                    num_points = target_num_points[target_voxel_idx]
+                    intersection_target_points.append(voxel_points[:num_points])
+        
+        # 合并交集点
+        if intersection_source_points:
+            intersection_source = np.concatenate(intersection_source_points, axis=0)
+        else:
+            intersection_source = np.array([]).reshape(0, 3)
+            
+        if intersection_target_points:
+            intersection_target = np.concatenate(intersection_target_points, axis=0)
+        else:
+            intersection_target = np.array([]).reshape(0, 3)
+        
+        # 2. 应用智能采样策略
+        final_source = self._apply_sampling_to_pointcloud(
+            source_voxels, source_num_points, intersection_source, 
+            intersection_indices, source_coords, target_points
+        )
+        
+        final_target = self._apply_sampling_to_pointcloud(
+            target_voxels, target_num_points, intersection_target,
+            intersection_indices, target_coords, target_points
+        )
+        
+        return final_source, final_target
+    
+    def _apply_sampling_to_pointcloud(self, voxels, num_points_per_voxel, 
+                                    intersection_points, intersection_indices,
+                                    coords, target_points):
+        """对单个点云应用采样策略"""
+        num_intersection = len(intersection_points)
+        
+        if num_intersection >= target_points:
+            # 情况1：交集点已经足够，直接从交集中采样
+            indices = np.random.choice(num_intersection, target_points, replace=False)
+            return intersection_points[indices]
+        else:
+            # 情况2：交集点不够，保留所有交集点 + 随机采样其他点
+            remaining_points = target_points - num_intersection
+            
+            # 获取非交集体素的点
+            non_intersection_points = self._get_non_intersection_points(
+                voxels, num_points_per_voxel, intersection_indices, coords
+            )
+            
+            if len(non_intersection_points) >= remaining_points:
+                # 从非交集点中随机采样
+                indices = np.random.choice(len(non_intersection_points), 
+                                         remaining_points, replace=False)
+                sampled_non_intersection = non_intersection_points[indices]
+                return np.concatenate([intersection_points, sampled_non_intersection], axis=0)
+            else:
+                # 非交集点也不够，使用重复采样
+                all_points = np.concatenate([intersection_points, non_intersection_points], axis=0)
+                shortage = target_points - len(all_points)
+                
+                if shortage > 0:
+                    # 重复采样补足
+                    indices = np.random.choice(len(all_points), shortage, replace=True)
+                    repeated_points = all_points[indices]
+                    return np.concatenate([all_points, repeated_points], axis=0)
+                else:
+                    return all_points
+    
+    def _get_non_intersection_points(self, voxels, num_points_per_voxel, 
+                                   intersection_indices, coords):
+        """获取非交集体素中的所有点"""
+        grid_size = self.voxel_config['voxel_grid_size']
+        voxel_indices = (coords[:, 1] * (grid_size**2) + 
+                        coords[:, 0] * grid_size + 
+                        coords[:, 2])
+        
+        non_intersection_points = []
+        
+        for i, voxel_idx in enumerate(voxel_indices):
+            if voxel_idx not in intersection_indices:
+                num_points = num_points_per_voxel[i]
+                if num_points > 0:
+                    non_intersection_points.append(voxels[i][:num_points])
+        
+        if non_intersection_points:
+            return np.concatenate(non_intersection_points, axis=0)
+        else:
+            return np.array([]).reshape(0, 3)
+    
+    def _fallback_random_sampling(self, source_points, target_points):
+        """回退到随机采样策略"""
+        target_size = self.sampling_config['target_points']
+        
+        # 对源点云采样
+        if len(source_points) > target_size:
+            indices = np.random.choice(len(source_points), target_size, replace=False)
+            source_sampled = source_points[indices]
+        else:
+            source_sampled = source_points
+            
+        # 对目标点云采样
+        if len(target_points) > target_size:
+            indices = np.random.choice(len(target_points), target_size, replace=False)
+            target_sampled = target_points[indices]
+        else:
+            target_sampled = target_points
+            
+        return source_sampled, target_sampled, np.array([])
+    
+    def __getitem__(self, index):
+        """获取数据项"""
+        pair_info = self.pairs[index]
+        
+        # 1. 加载原始点云
+        source_points = self._load_ply_file(pair_info['source'])
+        target_points = self._load_ply_file(pair_info['target'])
+        
+        if len(source_points) == 0 or len(target_points) == 0:
+            # 返回空数据
+            empty_points = np.zeros((self.sampling_config['target_points'], 3), dtype=np.float32)
+            return {
+                'source': torch.from_numpy(empty_points),
+                'target': torch.from_numpy(empty_points),
+                'igt': torch.eye(4),
+                'scene': pair_info['scene'],
+                'anatomy': pair_info['anatomy'],
+                'class_id': pair_info['class_id'],
+                'intersection_ratio': 0.0
+            }
+        
+        # 2. 应用Ground Truth变换（训练时）
+        igt = np.eye(4)
+        if self.train and self.transform is not None:
+            target_points, igt = self._apply_ground_truth_transform(target_points)
+        
+        # 3. 体素化处理和智能采样
+        final_source, final_target, intersection_indices = self._voxelize_point_clouds(
+            source_points, target_points
+        )
+        
+        # 4. 计算交集比例
+        total_voxels = max(len(final_source) // self.sampling_config['target_points'], 1)
+        intersection_ratio = len(intersection_indices) / total_voxels if total_voxels > 0 else 0.0
+        
+        # 5. 转换为torch tensor
+        result = {
+            'source': torch.from_numpy(final_source).float(),
+            'target': torch.from_numpy(final_target).float(),
+            'igt': torch.from_numpy(igt).float(),
+            'scene': pair_info['scene'],
+            'anatomy': pair_info['anatomy'],
+            'class_id': pair_info['class_id'],
+            'intersection_ratio': intersection_ratio
+        }
+        
+        # 6. 可视化数据（可选）
+        if self.vis:
+            result.update({
+                'source_original': torch.from_numpy(source_points).float(),
+                'target_original': torch.from_numpy(target_points).float()
+            })
+        
+        return result
+    
+    def get_sample_info(self, index):
+        """获取样本信息（用于分析）"""
+        if index >= len(self.pairs):
+            raise IndexError(f"索引 {index} 超出范围 (数据集大小: {len(self.pairs)})")
+        
+        pair_info = self.pairs[index]
+        return {
+            'sequence': pair_info['scene'],
+            'frame1': os.path.basename(pair_info['source']),
+            'frame2': os.path.basename(pair_info['target']),
+            'anatomy': pair_info['anatomy'],
+            'class_id': pair_info['class_id']
+        }
+    
+    def analyze_processing_pipeline(self, index):
+        """分析处理流程中点云数量的变化"""
+        if index >= len(self.pairs):
+            raise IndexError(f"索引 {index} 超出范围 (数据集大小: {len(self.pairs)})")
+        
+        pair_info = self.pairs[index]
+        
+        # 1. 加载原始点云
+        source_points = self._load_ply_file(pair_info['source'])
+        target_points = self._load_ply_file(pair_info['target'])
+        
+        original_points1 = len(source_points)
+        original_points2 = len(target_points)
+        
+        if original_points1 == 0 or original_points2 == 0:
+            return {
+                'original_points1': original_points1,
+                'original_points2': original_points2,
+                'voxelized_points1': 0,
+                'voxelized_points2': 0,
+                'sampled_points1': 0,
+                'sampled_points2': 0,
+                'final_points1': 0,
+                'final_points2': 0
+            }
+        
+        # 2. 应用Ground Truth变换（如果需要）
+        igt = np.eye(4)
+        if self.train and self.transform is not None:
+            target_points, igt = self._apply_ground_truth_transform(target_points)
+        
+        # 3. 体素化处理
+        try:
+            # 使用Open3D进行体素化
+            source_pcd = o3d.geometry.PointCloud()
+            source_pcd.points = o3d.utility.Vector3dVector(source_points)
+            source_voxelized = source_pcd.voxel_down_sample(voxel_size=self.voxel_config['voxel_size'])
+            source_voxelized_points = np.asarray(source_voxelized.points)
+            
+            target_pcd = o3d.geometry.PointCloud()
+            target_pcd.points = o3d.utility.Vector3dVector(target_points)
+            target_voxelized = target_pcd.voxel_down_sample(voxel_size=self.voxel_config['voxel_size'])
+            target_voxelized_points = np.asarray(target_voxelized.points)
+            
+            voxelized_points1 = len(source_voxelized_points)
+            voxelized_points2 = len(target_voxelized_points)
+            
+            # 4. 采样处理
+            target_size = self.sampling_config['target_points']
+            
+            # 对源点云采样
+            if voxelized_points1 > target_size:
+                indices = np.random.choice(voxelized_points1, target_size, replace=False)
+                sampled_source = source_voxelized_points[indices]
+            else:
+                sampled_source = source_voxelized_points
+                
+            # 对目标点云采样
+            if voxelized_points2 > target_size:
+                indices = np.random.choice(voxelized_points2, target_size, replace=False)
+                sampled_target = target_voxelized_points[indices]
+            else:
+                sampled_target = target_voxelized_points
+            
+            sampled_points1 = len(sampled_source)
+            sampled_points2 = len(sampled_target)
+            
+            # 5. 最终输出（确保达到目标点数）
+            if sampled_points1 < target_size:
+                # 重复采样补足
+                shortage = target_size - sampled_points1
+                indices = np.random.choice(sampled_points1, shortage, replace=True)
+                repeated_points = sampled_source[indices]
+                final_source = np.concatenate([sampled_source, repeated_points], axis=0)
+            else:
+                final_source = sampled_source
+                
+            if sampled_points2 < target_size:
+                # 重复采样补足
+                shortage = target_size - sampled_points2
+                indices = np.random.choice(sampled_points2, shortage, replace=True)
+                repeated_points = sampled_target[indices]
+                final_target = np.concatenate([sampled_target, repeated_points], axis=0)
+            else:
+                final_target = sampled_target
+            
+            final_points1 = len(final_source)
+            final_points2 = len(final_target)
+            
+        except Exception as e:
+            print(f"处理过程中出错: {e}")
+            # 返回基本统计信息
+            voxelized_points1 = original_points1
+            voxelized_points2 = original_points2
+            sampled_points1 = min(original_points1, self.sampling_config['target_points'])
+            sampled_points2 = min(original_points2, self.sampling_config['target_points'])
+            final_points1 = self.sampling_config['target_points']
+            final_points2 = self.sampling_config['target_points']
+        
+        return {
+            'original_points1': original_points1,
+            'original_points2': original_points2,
+            'voxelized_points1': voxelized_points1,
+            'voxelized_points2': voxelized_points2,
+            'sampled_points1': sampled_points1,
+            'sampled_points2': sampled_points2,
+            'final_points1': final_points1,
+            'final_points2': final_points2
+        }
+
+
+def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_one',
+                       mag=0.8, train=True, vis=False, **kwargs):
+    """
+    创建C3VD数据集的便捷函数
+    
+    Args:
+        source_root: 源点云根目录
+        target_root: 目标点云根目录
+        pairing_strategy: 配对策略
+        mag: Ground Truth变换幅度
+        train: 是否为训练模式
+        vis: 是否返回可视化数据
+        **kwargs: 其他配置参数
+    
+    Returns:
+        C3VDDataset实例
+    """
+    # C3VD推荐的体素化配置
+    voxel_config = kwargs.get('voxel_config', {
+        'voxel_size': 0.05,
+        'voxel_grid_size': 32,
+        'max_voxel_points': 100,
+        'max_voxels': 20000,
+        'min_voxel_points_ratio': 0.1
+    })
+    
+    # 智能采样配置
+    sampling_config = kwargs.get('sampling_config', {
+        'target_points': 1024,
+        'intersection_priority': True,
+        'min_intersection_ratio': 0.3,
+        'max_intersection_ratio': 0.7
+    })
+    
+    # Ground Truth变换（训练时）
+    transform = None
+    if train:
+        transform = RandomTransformSE3(mag=mag, mag_randomly=True)
+    
+    return C3VDDataset(
+        source_root=source_root,
+        target_root=target_root,
+        pairing_strategy=pairing_strategy,
+        voxel_config=voxel_config,
+        sampling_config=sampling_config,
+        transform=transform,
+        train=train,
+        vis=vis
+    )

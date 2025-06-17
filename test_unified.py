@@ -48,12 +48,43 @@ def parse_arguments():
     
     # 数据集设置
     parser.add_argument('--dataset-type', default='modelnet', 
-                        choices=['modelnet', 'shapenet2', 'kitti', '3dmatch'],
+                        choices=['modelnet', 'shapenet2', 'kitti', '3dmatch', 'c3vd'],
                         help='数据集类型')
     parser.add_argument('--num-points', default=1024, type=int,
                         help='点云中的点数')
     parser.add_argument('--categoryfile', default='', type=str,
                         help='类别文件路径（ModelNet需要）')
+    
+    # C3VD数据集特定参数
+    parser.add_argument('--c3vd-source-root', default='', type=str,
+                        help='C3VD源点云根目录路径')
+    parser.add_argument('--c3vd-target-root', default='', type=str,
+                        help='C3VD目标点云根目录路径（可选）')
+    parser.add_argument('--c3vd-source-subdir', default='C3VD_ply_source', type=str,
+                        help='C3VD源点云子目录名称')
+    parser.add_argument('--c3vd-target-subdir', default='visible_point_cloud_ply_depth', type=str,
+                        help='C3VD目标点云子目录名称')
+    parser.add_argument('--c3vd-pairing-strategy', default='one_to_one',
+                        choices=['one_to_one', 'scene_reference', 'source_to_source', 'target_to_target', 'all'],
+                        help='C3VD配对策略')
+    parser.add_argument('--c3vd-test-transform-mags', default='0.2,0.4,0.6,0.8', type=str,
+                        help='C3VD测试变换幅度列表（逗号分隔）')
+    
+    # 体素化参数
+    parser.add_argument('--voxel-size', default=0.05, type=float,
+                        help='体素大小')
+    parser.add_argument('--voxel-grid-size', default=32, type=int,
+                        help='体素网格大小')
+    parser.add_argument('--max-voxel-points', default=100, type=int,
+                        help='每个体素最大点数')
+    parser.add_argument('--max-voxels', default=20000, type=int,
+                        help='最大体素数量')
+    parser.add_argument('--min-voxel-points-ratio', default=0.1, type=float,
+                        help='最小体素点数比例')
+    parser.add_argument('--voxel-after-transf', action='store_true', default=True,
+                        help='是否在变换后进行体素化（默认True）')
+    parser.add_argument('--voxel-before-transf', dest='voxel_after_transf', action='store_false',
+                        help='在变换前进行体素化（与--voxel-after-transf相反）')
     
     # 模型设置
     parser.add_argument('--dim-k', default=1024, type=int,
@@ -163,6 +194,10 @@ class UnifiedTester:
         """创建数据加载器"""
         LOGGER.info(f"创建 {self.args.dataset_type} 测试数据加载器...")
         
+        # C3VD数据集特殊处理
+        if self.args.dataset_type == 'c3vd':
+            return self._create_c3vd_data_loader()
+        
         # 根据测试模式选择数据源
         if self.args.test_mode == 'single':
             data_source = 'original' if self.args.model_type == 'original' else 'improved'
@@ -200,6 +235,85 @@ class UnifiedTester:
         )
         
         LOGGER.info(f"测试集大小: {len(testset)}")
+        return test_loader
+    
+    def _create_c3vd_data_loader(self):
+        """创建C3VD数据加载器"""
+        from data_utils import create_c3vd_dataset
+        
+        LOGGER.info("创建C3VD测试数据集...")
+        
+        # 确定数据路径
+        if self.args.c3vd_source_root:
+            source_root = self.args.c3vd_source_root
+        else:
+            source_root = os.path.join(self.args.dataset_path, self.args.c3vd_source_subdir)
+        
+        if self.args.c3vd_target_root:
+            target_root = self.args.c3vd_target_root
+        else:
+            target_root = os.path.join(self.args.dataset_path, self.args.c3vd_target_subdir)
+        
+        # 验证路径存在
+        if not os.path.exists(source_root):
+            raise FileNotFoundError(f"C3VD源点云路径不存在: {source_root}")
+        if not os.path.exists(target_root):
+            raise FileNotFoundError(f"C3VD目标点云路径不存在: {target_root}")
+        
+        # 体素化配置
+        voxel_config = {
+            'voxel_size': self.args.voxel_size,
+            'voxel_grid_size': self.args.voxel_grid_size,
+            'max_voxel_points': self.args.max_voxel_points,
+            'max_voxels': self.args.max_voxels,
+            'min_voxel_points_ratio': self.args.min_voxel_points_ratio
+        }
+        
+        # 智能采样配置
+        sampling_config = {
+            'target_points': self.args.num_points,
+            'intersection_priority': True,
+            'min_intersection_ratio': 0.3,
+            'max_intersection_ratio': 0.7
+        }
+        
+        # 解析测试变换幅度
+        test_mags = [float(x.strip()) for x in self.args.c3vd_test_transform_mags.split(',')]
+        
+        # 使用第一个变换幅度创建测试集
+        testset = create_c3vd_dataset(
+            source_root=source_root,
+            target_root=target_root,
+            pairing_strategy=self.args.c3vd_pairing_strategy,
+            mag=test_mags[0],  # 使用第一个变换幅度
+            train=False,
+            vis=False,
+            voxel_config=voxel_config,
+            sampling_config=sampling_config,
+            voxel_after_transf=self.args.voxel_after_transf
+        )
+        
+        # 限制测试样本数量
+        if self.args.num_test_samples > 0 and len(testset) > self.args.num_test_samples:
+            indices = torch.randperm(len(testset))[:self.args.num_test_samples]
+            testset = torch.utils.data.Subset(testset, indices)
+        
+        # 创建数据加载器
+        test_loader = torch.utils.data.DataLoader(
+            testset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        LOGGER.info(f"C3VD测试集大小: {len(testset)}")
+        LOGGER.info(f"源点云路径: {source_root}")
+        LOGGER.info(f"目标点云路径: {target_root}")
+        LOGGER.info(f"配对策略: {self.args.c3vd_pairing_strategy}")
+        LOGGER.info(f"测试变换幅度: {test_mags}")
+        
         return test_loader
     
     def test_single_model(self):

@@ -23,7 +23,7 @@ C3VD数据集集成提供了以下功能：
 - ✅ **智能采样策略** - 优先保留交集体素，提高配准精度
 - ✅ **多种配对策略** - 支持一对一、场景参考、数据增强等配对方式
 - ✅ **Ground Truth变换** - 自动生成配准任务的变换矩阵
-- ✅ **专用训练/测试脚本** - 简化C3VD数据集的使用流程
+- ✅ **统一训练/测试框架** - 使用统一脚本简化C3VD数据集的使用流程
 - ✅ **全面的评估指标** - 旋转误差、平移误差、成功率等
 
 ## 📁 数据集准备
@@ -215,9 +215,11 @@ graph TD
 使用默认配置训练改进版PointNetLK：
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_improved \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_improved \
+    --model-type improved \
     --epochs 100 \
     --batch-size 16
 ```
@@ -227,10 +229,12 @@ python train_c3vd.py \
 测试训练好的模型：
 
 ```bash
-python test_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
     --model-path ./logs/c3vd_improved_best.pth \
-    --output-dir ./test_results \
+    --outfile ./test_results \
+    --model-type improved \
     --save-results
 ```
 
@@ -259,6 +263,8 @@ python test_c3vd.py \
 | `--max-voxel-points` | `100` | 每个体素最大点数 |
 | `--max-voxels` | `20000` | 最大体素数量 |
 | `--min-voxel-points-ratio` | `0.1` | 最小体素点数比例 |
+| `--voxel-after-transf` | `True` | 在变换后进行体素化 |
+| `--voxel-before-transf` | `False` | 在变换前进行体素化 |
 
 ### 配对策略使用指南
 
@@ -275,12 +281,13 @@ python test_c3vd.py \
 ### 示例1：标准一对一训练
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_one_to_one \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_one_to_one \
     --model-type improved \
-    --pairing-strategy one_to_one \
-    --transform-mag 0.8 \
+    --c3vd-pairing-strategy one_to_one \
+    --c3vd-transform-mag 0.8 \
     --epochs 200 \
     --batch-size 16 \
     --learning-rate 0.001 \
@@ -290,11 +297,13 @@ python train_c3vd.py \
 ### 示例2：场景参考训练
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_scene_ref \
-    --pairing-strategy scene_reference \
-    --transform-mag 0.6 \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_scene_ref \
+    --model-type improved \
+    --c3vd-pairing-strategy scene_reference \
+    --c3vd-transform-mag 0.6 \
     --epochs 250 \
     --batch-size 12 \
     --voxel-grid-size 64 \
@@ -304,11 +313,13 @@ python train_c3vd.py \
 ### 示例3：完整数据增强训练
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_full_augmented \
-    --pairing-strategy all \
-    --transform-mag 0.6 \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_full_augmented \
+    --model-type improved \
+    --c3vd-pairing-strategy all \
+    --c3vd-transform-mag 0.6 \
     --epochs 300 \
     --batch-size 8 \
     --learning-rate 0.0005 \
@@ -319,9 +330,10 @@ python train_c3vd.py \
 ### 示例4：原版模型训练
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_original \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_original \
     --model-type original \
     --delta 1e-2 \
     --learn-delta \
@@ -332,12 +344,36 @@ python train_c3vd.py \
 ### 示例5：恢复训练
 
 ```bash
-python train_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
-    --output-prefix ./logs/c3vd_resumed \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_resumed \
+    --model-type improved \
     --resume ./logs/c3vd_standard_epoch_50.pth \
     --start-epoch 50 \
     --epochs 200
+```
+
+### 示例6：体素化时机控制
+
+```bash
+# 变换后体素化（默认，适合标准训练）
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_after_transf \
+    --model-type improved \
+    --c3vd-transform-mag 0.6 \
+    --voxel-after-transf
+
+# 变换前体素化（适合大幅度变换）
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./logs/c3vd_before_transf \
+    --model-type improved \
+    --c3vd-transform-mag 1.0 \
+    --voxel-before-transf
 ```
 
 ## 🧪 测试示例
@@ -345,12 +381,13 @@ python train_c3vd.py \
 ### 示例1：标准测试
 
 ```bash
-python test_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
     --model-path ./logs/c3vd_improved_best.pth \
-    --output-dir ./test_results/standard \
+    --outfile ./test_results/standard \
     --model-type improved \
-    --test-transform-mags "0.2,0.4,0.6,0.8" \
+    --c3vd-test-transform-mags "0.2,0.4,0.6,0.8" \
     --save-results \
     --batch-size 8
 ```
@@ -358,12 +395,14 @@ python test_c3vd.py \
 ### 示例2：详细评估
 
 ```bash
-python test_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
     --model-path ./logs/c3vd_improved_best.pth \
-    --output-dir ./test_results/detailed \
-    --test-transform-mags "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0" \
-    --pairing-strategy all \
+    --outfile ./test_results/detailed \
+    --model-type improved \
+    --c3vd-test-transform-mags "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0" \
+    --c3vd-pairing-strategy all \
     --save-results \
     --visualize
 ```
@@ -372,23 +411,84 @@ python test_c3vd.py \
 
 ```bash
 # 测试一对一配对
-python test_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
     --model-path ./logs/c3vd_improved_best.pth \
-    --output-dir ./test_results/one_to_one \
-    --pairing-strategy one_to_one \
+    --outfile ./test_results/one_to_one \
+    --model-type improved \
+    --c3vd-pairing-strategy one_to_one \
     --save-results
 
 # 测试场景参考配对
-python test_c3vd.py \
-    --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
     --model-path ./logs/c3vd_improved_best.pth \
-    --output-dir ./test_results/scene_reference \
-    --pairing-strategy scene_reference \
+    --outfile ./test_results/scene_reference \
+    --model-type improved \
+    --c3vd-pairing-strategy scene_reference \
     --save-results
 ```
 
+### 示例4：体素化时机对比测试
+
+```bash
+# 测试变换后体素化模型
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --model-path ./logs/c3vd_after_transf_best.pth \
+    --outfile ./test_results/after_transf \
+    --model-type improved \
+    --voxel-after-transf \
+    --save-results
+
+# 测试变换前体素化模型
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --model-path ./logs/c3vd_before_transf_best.pth \
+    --outfile ./test_results/before_transf \
+    --model-type improved \
+    --voxel-before-transf \
+    --save-results
+```
+
+### 并行测试
+
+```bash
+# 使用多个GPU并行测试不同变换幅度
+CUDA_VISIBLE_DEVICES=0 python test_unified.py --dataset-type c3vd --c3vd-test-transform-mags "0.2,0.4" --dataset-path /mnt/f/Datasets/C3VD_sever_datasets --model-path ./model.pth --outfile ./test_0 &
+CUDA_VISIBLE_DEVICES=1 python test_unified.py --dataset-type c3vd --c3vd-test-transform-mags "0.6,0.8" --dataset-path /mnt/f/Datasets/C3VD_sever_datasets --model-path ./model.pth --outfile ./test_1 &
+```
+
 ## 🔧 体素化配置
+
+### 体素化时机控制
+
+C3VD数据集支持控制体素化的执行时机，这对配准精度有重要影响：
+
+#### `--voxel-after-transf` (默认)
+- **执行顺序**: 加载点云 → 应用Ground Truth变换 → 体素化处理
+- **优点**: 体素化基于变换后的点云，重叠区域计算更准确
+- **缺点**: 大幅度变换可能导致重叠区域减少
+- **适用场景**: 标准配准训练，变换幅度适中(≤0.8)
+
+#### `--voxel-before-transf`
+- **执行顺序**: 加载点云 → 体素化处理 → 应用Ground Truth变换
+- **优点**: 保证体素化质量，避免变换导致的重叠区域丢失
+- **缺点**: 体素化后的变换可能破坏体素结构
+- **适用场景**: 大幅度变换(>0.8)，数据质量不佳时
+
+#### 选择建议
+
+| 场景 | 推荐设置 | 变换幅度 | 说明 |
+|------|----------|----------|------|
+| 标准训练 | `--voxel-after-transf` | 0.5-0.8 | 平衡精度和稳定性 |
+| 大幅度变换 | `--voxel-before-transf` | 0.8-1.2 | 避免重叠区域丢失 |
+| 数据质量差 | `--voxel-before-transf` | 任意 | 保证体素化质量 |
+| 高精度要求 | `--voxel-after-transf` | 0.3-0.6 | 最佳重叠区域计算 |
 
 ### 推荐配置
 
@@ -400,7 +500,8 @@ python test_c3vd.py \
 --voxel-grid-size 64 \
 --max-voxel-points 150 \
 --max-voxels 30000 \
---min-voxel-points-ratio 0.05
+--min-voxel-points-ratio 0.05 \
+--voxel-after-transf
 ```
 
 #### 标准配置（平衡性能）
@@ -409,7 +510,8 @@ python test_c3vd.py \
 --voxel-grid-size 32 \
 --max-voxel-points 100 \
 --max-voxels 20000 \
---min-voxel-points-ratio 0.1
+--min-voxel-points-ratio 0.1 \
+--voxel-after-transf
 ```
 
 #### 快速配置（高效率）
@@ -418,7 +520,19 @@ python test_c3vd.py \
 --voxel-grid-size 24 \
 --max-voxel-points 80 \
 --max-voxels 15000 \
---min-voxel-points-ratio 0.15
+--min-voxel-points-ratio 0.15 \
+--voxel-before-transf
+```
+
+#### 大幅度变换配置
+```bash
+--voxel-size 0.05 \
+--voxel-grid-size 32 \
+--max-voxel-points 100 \
+--max-voxels 20000 \
+--min-voxel-points-ratio 0.1 \
+--voxel-before-transf \
+--transform-mag 1.0
 ```
 
 ### 体素化参数调优指南
@@ -472,8 +586,8 @@ python test_c3vd.py \
 1. **并行测试**:
    ```bash
    # 使用多个GPU并行测试不同变换幅度
-   CUDA_VISIBLE_DEVICES=0 python test_c3vd.py --test-transform-mags "0.2,0.4" &
-   CUDA_VISIBLE_DEVICES=1 python test_c3vd.py --test-transform-mags "0.6,0.8" &
+   CUDA_VISIBLE_DEVICES=0 python test_unified.py --test-transform-mags "0.2,0.4" &
+   CUDA_VISIBLE_DEVICES=1 python test_unified.py --test-transform-mags "0.6,0.8" &
    ```
 
 2. **批量处理**:
@@ -560,6 +674,35 @@ ls /path/to/C3VD_sever_datasets/C3VD_ref/*/coverage_mesh.ply
 --pairing-strategy one_to_one
 ```
 
+#### 6. 体素化时机选择问题
+
+**症状**: 体素化警告过多或配准精度不佳
+
+**解决方案**:
+```bash
+# 情况1：大量"点云无重叠区域"警告
+# 原因：变换幅度过大，建议使用变换前体素化
+--voxel-before-transf \
+--transform-mag 0.6  # 降低变换幅度
+
+# 情况2：配准精度不够高
+# 原因：体素化质量不佳，建议使用变换后体素化
+--voxel-after-transf \
+--transform-mag 0.5  # 使用适中的变换幅度
+
+# 情况3：训练不稳定
+# 尝试不同的体素化时机
+--voxel-before-transf  # 如果当前使用after
+# 或
+--voxel-after-transf   # 如果当前使用before
+```
+
+**选择指导**:
+- 变换幅度 > 0.8：使用 `--voxel-before-transf`
+- 变换幅度 ≤ 0.8：使用 `--voxel-after-transf`
+- 数据质量差：使用 `--voxel-before-transf`
+- 追求高精度：使用 `--voxel-after-transf` + 小变换幅度
+
 ### 调试模式
 
 启用详细日志输出：
@@ -569,8 +712,15 @@ ls /path/to/C3VD_sever_datasets/C3VD_ref/*/coverage_mesh.ply
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 export CUDA_LAUNCH_BLOCKING=1
 
-# 运行训练
-python train_c3vd.py --c3vd-root /mnt/f/Datasets/C3VD_sever_datasets --output-prefix ./debug --epochs 5 --log-interval 1
+# 运行调试
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /mnt/f/Datasets/C3VD_sever_datasets \
+    --outfile ./debug \
+    --model-type improved \
+    --epochs 1 \
+    --batch-size 2 \
+    --log-interval 1
 ```
 
 ### 性能监控

@@ -136,43 +136,29 @@ class PointNetLK_improved:
 
 ```bash
 # 基础训练
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
-    --model_type legacy \
-    --batch_size 4 \
-    --epochs 100 \
-    --lr 0.001
-
-# 完整参数训练
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
-    --model_type legacy \
-    --pairing_strategy one_to_one \
-    --voxel_size 4.0 \
-    --num_points 1024 \
-    --batch_size 8 \
-    --epochs 200 \
-    --lr 0.001 \
-    --lr_decay 0.7 \
-    --lr_decay_step 40 \
-    --save_freq 10 \
-    --log_freq 100 \
-    --output_dir ./results/c3vd_legacy
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./c3vd_results/basic_model \
+    --model-type improved \
+    --epochs 100
 ```
 
 #### 改进PointNetLK训练
 
 ```bash
-# 改进版本训练
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
-    --model_type improved \
-    --batch_size 8 \
-    --epochs 150 \
-    --lr 0.0005 \
-    --feature_dim 1024 \
-    --use_residual \
-    --multi_scale
+# 高级训练
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./c3vd_results/advanced_model \
+    --model-type improved \
+    --c3vd-pairing-strategy all \
+    --c3vd-transform-mag 0.6 \
+    --voxel-grid-size 64 \
+    --max-voxel-points 150 \
+    --epochs 200 \
+    --batch-size 12
 ```
 
 ### ModelNet40数据集训练
@@ -216,12 +202,15 @@ python train_modelnet.py \
 ### 统一训练脚本
 
 ```bash
-# 使用统一训练脚本
+# 恢复训练
 python train_unified.py \
-    --dataset c3vd \
-    --data_root /path/to/data \
-    --model_type legacy \
-    --config configs/c3vd_default.yaml
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./c3vd_results/resumed_model \
+    --model-type improved \
+    --resume ./c3vd_results/basic_model_epoch_50.pth \
+    --start-epoch 50 \
+    --epochs 100
 ```
 
 ---
@@ -233,20 +222,23 @@ python train_unified.py \
 #### 单模型测试
 
 ```bash
-# 原版PointNetLK测试
-python test_c3vd.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
-    --model_type legacy \
-    --model_path ./results/c3vd_legacy/best_model.pth \
-    --batch_size 1 \
-    --save_results
+# 基础测试
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --model-path ./c3vd_results/basic_model_best.pth \
+    --outfile ./test_results/basic \
+    --model-type improved
 
-# 改进PointNetLK测试
-python test_c3vd.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
-    --model_type improved \
-    --model_path ./results/c3vd_improved/best_model.pth \
-    --batch_size 1 \
+# 详细测试
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --model-path ./c3vd_results/advanced_model_best.pth \
+    --outfile ./test_results/detailed \
+    --model-type improved \
+    --c3vd-test-transform-mags "0.2,0.4,0.6,0.8" \
+    --save-results \
     --visualize
 ```
 
@@ -255,7 +247,7 @@ python test_c3vd.py \
 ```bash
 # 运行双模型对比测试
 python test_comprehensive.py \
-    --c3vd_root /path/to/C3VD_sever_datasets \
+    --c3vd_root /path/to/C3VD \
     --legacy_model ./results/c3vd_legacy/best_model.pth \
     --improved_model ./results/c3vd_improved/best_model.pth \
     --output_dir ./comparison_results
@@ -278,10 +270,11 @@ python test_modelnet.py \
 ```bash
 # 使用统一测试脚本
 python test_unified.py \
-    --dataset c3vd \
-    --data_root /path/to/data \
-    --model_path ./results/model.pth \
-    --output_dir ./test_results
+    --dataset-type c3vd \
+    --dataset-path /path/to/data \
+    --model-path ./results/model.pth \
+    --outfile ./test_results \
+    --model-type improved
 ```
 
 ---
@@ -375,19 +368,22 @@ python test_unified.py \
 python data_utils.py --c3vd_root /path/to/C3VD --validate
 
 # 2. 单个epoch训练测试
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD \
-    --model_type legacy \
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./test \
+    --model-type improved \
     --epochs 1 \
-    --batch_size 2 \
-    --max_samples 50
+    --batch-size 2 \
+    --max-samples 50
 
 # 3. 快速测试
-python test_c3vd.py \
-    --c3vd_root /path/to/C3VD \
-    --model_path ./results/model.pth \
-    --batch_size 1 \
-    --max_samples 20
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --model-path ./test \
+    --batch-size 1 \
+    --max-samples 20
 ```
 
 ### Workflow 2: C3VD完整训练
@@ -397,20 +393,27 @@ python test_c3vd.py \
 python data_utils.py --c3vd_root /path/to/C3VD --preprocess
 
 # 2. 训练原版模型
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD \
-    --model_type legacy \
-    --epochs 200 \
-    --batch_size 8 \
-    --output_dir ./results/c3vd_legacy
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./results/c3vd_basic \
+    --model-type improved \
+    --epochs 100 \
+    --batch-size 16 \
+    --learning-rate 0.001
 
 # 3. 训练改进模型
-python train_c3vd.py \
-    --c3vd_root /path/to/C3VD \
-    --model_type improved \
-    --epochs 150 \
-    --batch_size 8 \
-    --output_dir ./results/c3vd_improved
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./results/c3vd_advanced \
+    --model-type improved \
+    --c3vd-pairing-strategy all \
+    --c3vd-transform-mag 0.6 \
+    --voxel-grid-size 64 \
+    --max-voxel-points 150 \
+    --epochs 200 \
+    --batch-size 12
 
 # 4. 对比测试
 python test_comprehensive.py \
@@ -450,17 +453,23 @@ python test_modelnet.py \
 
 ```bash
 # 1. C3VD训练，ModelNet测试
-python train_c3vd.py --c3vd_root /path/to/C3VD --epochs 100
+python train_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --outfile ./results/c3vd_model \
+    --model-type improved \
+    --epochs 100
 python test_modelnet.py \
     --data_root ./ModelNet40 \
-    --model_path ./results/c3vd_model.pth \
+    --model_path ./results/c3vd_model_best.pth \
     --cross_domain
 
 # 2. ModelNet训练，C3VD测试
 python train_modelnet.py --data_root ./ModelNet40 --epochs 100
-python test_c3vd.py \
-    --c3vd_root /path/to/C3VD \
-    --model_path ./results/modelnet_model.pth \
+python test_unified.py \
+    --dataset-type c3vd \
+    --dataset-path /path/to/C3VD \
+    --model-path ./results/modelnet_model_best.pth \
     --cross_domain
 ```
 
@@ -554,7 +563,7 @@ python analysis/visualize_registration.py \
 
 ```bash
 # 启用调试模式
-python train_c3vd.py \
+python train_unified.py \
     --debug \
     --verbose \
     --save_intermediate \

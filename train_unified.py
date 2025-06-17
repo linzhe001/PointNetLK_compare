@@ -49,6 +49,10 @@ def parse_arguments():
                         help='C3VD源点云根目录路径')
     parser.add_argument('--c3vd-target-root', default='', type=str,
                         help='C3VD目标点云根目录路径（可选）')
+    parser.add_argument('--c3vd-source-subdir', default='C3VD_ply_source', type=str,
+                        help='C3VD源点云子目录名称')
+    parser.add_argument('--c3vd-target-subdir', default='visible_point_cloud_ply_depth', type=str,
+                        help='C3VD目标点云子目录名称')
     parser.add_argument('--c3vd-pairing-strategy', default='one_to_one',
                         choices=['one_to_one', 'scene_reference', 'source_to_source', 'target_to_target', 'all'],
                         help='C3VD配对策略')
@@ -66,6 +70,10 @@ def parse_arguments():
                         help='最大体素数量')
     parser.add_argument('--min-voxel-points-ratio', default=0.1, type=float,
                         help='最小体素点数比例')
+    parser.add_argument('--voxel-after-transf', action='store_true', default=True,
+                        help='是否在变换后进行体素化（默认True）')
+    parser.add_argument('--voxel-before-transf', dest='voxel_after_transf', action='store_false',
+                        help='在变换前进行体素化（与--voxel-after-transf相反）')
     
     # 模型设置
     parser.add_argument('--dim-k', default=1024, type=int,
@@ -142,7 +150,7 @@ class UnifiedTrainer:
         self.model = self._create_model()
         
         # 初始化数据
-        self.train_loader, self.test_loader = self._create_data_loaders()
+        self.train_loader, self.val_loader = self._create_data_loaders()
         
         # 初始化优化器
         self.optimizer = self._create_optimizer()
@@ -227,8 +235,21 @@ class UnifiedTrainer:
         LOGGER.info("创建C3VD数据集...")
         
         # 确定数据路径
-        source_root = self.args.c3vd_source_root or self.args.dataset_path
-        target_root = self.args.c3vd_target_root or source_root
+        if self.args.c3vd_source_root:
+            source_root = self.args.c3vd_source_root
+        else:
+            source_root = os.path.join(self.args.dataset_path, self.args.c3vd_source_subdir)
+        
+        if self.args.c3vd_target_root:
+            target_root = self.args.c3vd_target_root
+        else:
+            target_root = os.path.join(self.args.dataset_path, self.args.c3vd_target_subdir)
+        
+        # 验证路径存在
+        if not os.path.exists(source_root):
+            raise FileNotFoundError(f"C3VD源点云路径不存在: {source_root}")
+        if not os.path.exists(target_root):
+            raise FileNotFoundError(f"C3VD目标点云路径不存在: {target_root}")
         
         # 体素化配置
         voxel_config = {
@@ -256,7 +277,8 @@ class UnifiedTrainer:
             train=True,
             vis=False,
             voxel_config=voxel_config,
-            sampling_config=sampling_config
+            sampling_config=sampling_config,
+            voxel_after_transf=self.args.voxel_after_transf
         )
         
         # 创建测试集（使用较小的变换幅度）
@@ -268,7 +290,8 @@ class UnifiedTrainer:
             train=False,
             vis=False,
             voxel_config=voxel_config,
-            sampling_config=sampling_config
+            sampling_config=sampling_config,
+            voxel_after_transf=self.args.voxel_after_transf
         )
         
         # 创建数据加载器
@@ -291,6 +314,8 @@ class UnifiedTrainer:
         )
         
         LOGGER.info(f"C3VD训练集大小: {len(trainset)}, 测试集大小: {len(testset)}")
+        LOGGER.info(f"源点云路径: {source_root}")
+        LOGGER.info(f"目标点云路径: {target_root}")
         LOGGER.info(f"配对策略: {self.args.c3vd_pairing_strategy}, 变换幅度: {self.args.c3vd_transform_mag}")
         LOGGER.info(f"体素化配置: 网格大小={self.args.voxel_grid_size}, 体素大小={self.args.voxel_size}")
         
@@ -368,41 +393,47 @@ class UnifiedTrainer:
     
     def evaluate(self, epoch):
         """评估模型"""
+        if not hasattr(self, 'val_loader') or self.val_loader is None:
+            LOGGER.warning("没有验证数据集，跳过评估")
+            return 0.0
+            
         self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
+        val_loss = 0.0
+        num_examples = 0
         
         with torch.no_grad():
-            for batch_idx, data in enumerate(self.test_loader):
-                if len(data) == 3:
-                    p0, p1, igt = data
+            for batch_idx, data in enumerate(self.val_loader):
+                # 处理不同数据格式
+                if isinstance(data, dict):
+                    # C3VD数据集格式
+                    p0 = data['source'].to(self.device)
+                    p1 = data['target'].to(self.device) 
+                    igt = data['igt'].to(self.device)
                 else:
-                    p0, p1 = data
-                    igt = torch.eye(4).unsqueeze(0).repeat(p0.size(0), 1, 1)
+                    # ModelNet等数据集格式
+                    p0, p1, igt = data
+                    p0 = p0.to(self.device)
+                    p1 = p1.to(self.device)
+                    igt = igt.to(self.device)
                 
-                p0, p1, igt = p0.to(self.device), p1.to(self.device), igt.to(self.device)
+                # 前向传播
+                if self.args.model_type == 'original':
+                    r, t = self.model(p0, p1)
+                    loss = self.model.compute_loss(r, t, igt, maxiter=self.args.max_iter)
+                else:
+                    loss = self.model.compute_loss(p0, p1, igt, maxiter=self.args.max_iter)
                 
-                try:
-                    # 在评估时，对于改进版模型，需要启用梯度计算来计算雅可比
-                    if self.args.model_type == 'improved':
-                        # 临时启用梯度计算
-                        p0.requires_grad_(True)
-                        p1.requires_grad_(True)
-                        with torch.enable_grad():
-                            loss = self.model.compute_loss(p0, p1, igt, maxiter=self.args.max_iter, mode='test')
-                    else:
-                        loss = self.model.compute_loss(p0, p1, igt, maxiter=self.args.max_iter)
-                    
-                    total_loss += loss.item()
-                    num_batches += 1
-                except Exception as e:
-                    LOGGER.warning(f"评估批次 {batch_idx} 时出错: {e}")
-                    continue
+                val_loss += loss.item()
+                num_examples += p0.size(0)
+                
+                # 限制验证批次数量，避免过长时间
+                if batch_idx >= 10:  # 只验证前10个批次
+                    break
         
-        avg_loss = total_loss / max(num_batches, 1)
-        LOGGER.info(f'评估 Epoch: {epoch}, 平均损失: {avg_loss:.6f}')
+        avg_val_loss = val_loss / max(num_examples, 1)
+        LOGGER.info(f'验证 Epoch: {epoch}, 平均损失: {avg_val_loss:.6f}')
         
-        return avg_loss
+        return avg_val_loss
     
     def _parse_batch_data(self, data):
         """解析批次数据（适配不同的数据格式）"""

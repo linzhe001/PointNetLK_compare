@@ -11,6 +11,7 @@ import six
 import copy
 import csv
 import open3d as o3d
+from pathlib import Path
 
 import utils
 
@@ -34,22 +35,35 @@ def load_3dmatch_batch_data(p0_fi, p1_fi, voxel_ratio):
     
 
 def find_voxel_overlaps(p0, p1, voxel):
+    # 计算两个点云的重叠边界框
     xmin, ymin, zmin = np.max(np.stack([np.min(p0, 0), np.min(p1, 0)]), 0)
     xmax, ymax, zmax = np.min(np.stack([np.max(p0, 0), np.max(p1, 0)]), 0)
     
-    # truncate the point cloud
+    # 检查是否有有效的重叠区域
+    if xmin >= xmax or ymin >= ymax or zmin >= zmax:
+        print(f"警告: 点云无重叠区域 - 边界框: x[{xmin:.3f}, {xmax:.3f}], y[{ymin:.3f}, {ymax:.3f}], z[{zmin:.3f}, {zmax:.3f}]")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), xmin, ymin, zmin, xmax, ymax, zmax, 0.1, 0.1, 0.1
+    
+    # 裁剪点云到重叠区域
     eps = 1e-6
     p0_ = p0[np.all(p0>[xmin+eps,ymin+eps,zmin+eps], axis=1) & np.all(p0<[xmax-eps,ymax-eps,zmax-eps], axis=1)]
     p1_ = p1[np.all(p1>[xmin+eps,ymin+eps,zmin+eps], axis=1) & np.all(p1<[xmax-eps,ymax-eps,zmax-eps], axis=1)]
     
-    # recalculate the constraints
-    xmin, ymin, zmin = np.max(np.stack([np.min(p0, 0), np.min(p1, 0)]), 0)
-    xmax, ymax, zmax = np.min(np.stack([np.max(p0, 0), np.max(p1, 0)]), 0)
-    vx = (xmax - xmin) / voxel
-    vy = (ymax - ymin) / voxel
-    vz = (zmax - zmin) / voxel
+    # 检查裁剪后的点云是否为空
+    if len(p0_) == 0 or len(p1_) == 0:
+        print(f"警告: 裁剪后点云为空 - 源点云: {len(p0_)}, 目标点云: {len(p1_)}")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), xmin, ymin, zmin, xmax, ymax, zmax, 0.1, 0.1, 0.1
     
-    return p0_, p1_, xmin, ymin, zmin, xmax, ymax, zmax, vx, vy, vz
+    # 使用裁剪后的点云重新计算更精确的边界框
+    xmin_refined, ymin_refined, zmin_refined = np.max(np.stack([np.min(p0_, 0), np.min(p1_, 0)]), 0)
+    xmax_refined, ymax_refined, zmax_refined = np.min(np.stack([np.max(p0_, 0), np.max(p1_, 0)]), 0)
+    
+    # 计算体素大小
+    vx = (xmax_refined - xmin_refined) / voxel
+    vy = (ymax_refined - ymin_refined) / voxel
+    vz = (zmax_refined - zmin_refined) / voxel
+    
+    return p0_, p1_, xmin_refined, ymin_refined, zmin_refined, xmax_refined, ymax_refined, zmax_refined, vx, vy, vz
 
 
 class ThreeDMatch_Testing(torch.utils.data.Dataset):
@@ -850,35 +864,36 @@ class Resampler:
 
 class C3VDDataset(torch.utils.data.Dataset):
     """
-    C3VD医学点云数据集，支持体素化和智能采样
-    基于addc3vd.mdc文档的完整实现
+    C3VD医学点云数据集
+    支持多种配对策略和体素化处理
     """
     
     def __init__(self, source_root, target_root=None, pairing_strategy='one_to_one',
                  voxel_config=None, sampling_config=None, transform=None, 
-                 train=True, vis=False):
+                 train=True, vis=False, voxel_after_transf=True):
         """
         初始化C3VD数据集
         
         Args:
-            source_root: 源点云根目录路径
-            target_root: 目标点云根目录路径（可选，默认与source_root相同）
-            pairing_strategy: 配对策略 ('one_to_one', 'scene_reference', 'source_to_source', 'target_to_target', 'all')
-            voxel_config: 体素化配置参数
-            sampling_config: 智能采样配置参数
-            transform: Ground Truth变换（训练时使用）
+            source_root: 源点云根目录
+            target_root: 目标点云根目录（可选，默认使用visible_point_cloud_ply_depth）
+            pairing_strategy: 配对策略
+            voxel_config: 体素化配置
+            sampling_config: 采样配置
+            transform: 数据变换（用于Ground Truth生成）
             train: 是否为训练模式
             vis: 是否返回可视化数据
+            voxel_after_transf: 是否在变换后进行体素化（True: 变换后体素化, False: 变换前体素化）
         """
-        super().__init__()
-        self.source_root = source_root
-        self.target_root = target_root or source_root
+        self.source_root = Path(source_root)
+        self.target_root = Path(target_root) if target_root else self.source_root / 'visible_point_cloud_ply_depth'
         self.pairing_strategy = pairing_strategy
         self.transform = transform
         self.train = train
         self.vis = vis
+        self.voxel_after_transf = voxel_after_transf
         
-        # 体素化配置（C3VD推荐配置）
+        # 默认体素化配置
         self.voxel_config = voxel_config or {
             'voxel_size': 0.05,
             'voxel_grid_size': 32,
@@ -887,7 +902,7 @@ class C3VDDataset(torch.utils.data.Dataset):
             'min_voxel_points_ratio': 0.1
         }
         
-        # 智能采样配置
+        # 默认采样配置
         self.sampling_config = sampling_config or {
             'target_points': 1024,
             'intersection_priority': True,
@@ -903,10 +918,18 @@ class C3VDDataset(torch.utils.data.Dataset):
             'trans': 4
         }
         
-        # 加载数据对列表
+        # 加载数据对
         self.pairs = self._load_pairs()
-        print(f"✅ C3VD数据集加载完成: {len(self.pairs)}个点云对")
-    
+        
+        print(f"C3VD数据集初始化完成:")
+        print(f"  源点云路径: {self.source_root}")
+        print(f"  目标点云路径: {self.target_root}")
+        print(f"  配对策略: {self.pairing_strategy}")
+        print(f"  数据对数量: {len(self.pairs)}")
+        print(f"  训练模式: {self.train}")
+        print(f"  体素化时机: {'变换后' if self.voxel_after_transf else '变换前'}")
+        print(f"  体素化配置: 网格大小={self.voxel_config['voxel_grid_size']}, 体素大小={self.voxel_config['voxel_size']}")
+
     def _load_pairs(self):
         """根据配对策略加载点云对列表"""
         pairs = []
@@ -1090,7 +1113,7 @@ class C3VDDataset(torch.utils.data.Dataset):
             
             if len(source_overlap) == 0 or len(target_overlap) == 0:
                 print("警告: 点云无重叠区域，回退到原始点云")
-                return source_points, target_points, np.array([])
+                return self._fallback_random_sampling(source_points, target_points)
             
             # 2. 体素化转换
             coords_range = (xmin, ymin, zmin, xmax, ymax, zmax)
@@ -1284,13 +1307,19 @@ class C3VDDataset(torch.utils.data.Dataset):
             return np.array([]).reshape(0, 3)
     
     def _fallback_random_sampling(self, source_points, target_points):
-        """回退到随机采样策略"""
+        """回退到随机采样策略，确保返回固定大小的点云"""
         target_size = self.sampling_config['target_points']
         
         # 对源点云采样
         if len(source_points) > target_size:
             indices = np.random.choice(len(source_points), target_size, replace=False)
             source_sampled = source_points[indices]
+        elif len(source_points) < target_size:
+            # 点数不足，重复采样补足
+            shortage = target_size - len(source_points)
+            indices = np.random.choice(len(source_points), shortage, replace=True)
+            repeated_points = source_points[indices]
+            source_sampled = np.concatenate([source_points, repeated_points], axis=0)
         else:
             source_sampled = source_points
             
@@ -1298,6 +1327,12 @@ class C3VDDataset(torch.utils.data.Dataset):
         if len(target_points) > target_size:
             indices = np.random.choice(len(target_points), target_size, replace=False)
             target_sampled = target_points[indices]
+        elif len(target_points) < target_size:
+            # 点数不足，重复采样补足
+            shortage = target_size - len(target_points)
+            indices = np.random.choice(len(target_points), shortage, replace=True)
+            repeated_points = target_points[indices]
+            target_sampled = np.concatenate([target_points, repeated_points], axis=0)
         else:
             target_sampled = target_points
             
@@ -1324,15 +1359,31 @@ class C3VDDataset(torch.utils.data.Dataset):
                 'intersection_ratio': 0.0
             }
         
-        # 2. 应用Ground Truth变换（训练时）
         igt = np.eye(4)
-        if self.train and self.transform is not None:
-            target_points, igt = self._apply_ground_truth_transform(target_points)
         
-        # 3. 体素化处理和智能采样
-        final_source, final_target, intersection_indices = self._voxelize_point_clouds(
-            source_points, target_points
-        )
+        if self.voxel_after_transf:
+            # 变换后体素化：先应用Ground Truth变换，再体素化
+            # 2. 应用Ground Truth变换（训练时）
+            if self.train and self.transform is not None:
+                target_points, igt = self._apply_ground_truth_transform(target_points)
+            
+            # 3. 体素化处理和智能采样
+            final_source, final_target, intersection_indices = self._voxelize_point_clouds(
+                source_points, target_points
+            )
+        else:
+            # 变换前体素化：先体素化，再应用Ground Truth变换
+            # 2. 体素化处理和智能采样
+            final_source, final_target, intersection_indices = self._voxelize_point_clouds(
+                source_points, target_points
+            )
+            
+            # 3. 应用Ground Truth变换（训练时）
+            if self.train and self.transform is not None:
+                # 将numpy数组转换为torch tensor进行变换
+                target_tensor = torch.from_numpy(final_target).float()
+                transformed_target, igt = self._apply_ground_truth_transform_to_tensor(target_tensor)
+                final_target = transformed_target.numpy()
         
         # 4. 计算交集比例
         total_voxels = max(len(final_source) // self.sampling_config['target_points'], 1)
@@ -1482,9 +1533,25 @@ class C3VDDataset(torch.utils.data.Dataset):
             'final_points2': final_points2
         }
 
+    def _apply_ground_truth_transform_to_tensor(self, target_tensor):
+        """对torch tensor应用Ground Truth变换"""
+        if self.transform is None:
+            return target_tensor, np.eye(4)
+        
+        # 应用变换
+        if hasattr(self.transform, 'apply_transform'):
+            # 使用RandomTransformSE3的apply_transform方法
+            x = self.transform.generate_transform()
+            transformed_tensor, igt = self.transform.apply_transform(target_tensor, x)
+            return transformed_tensor, igt.numpy()
+        else:
+            # 直接调用transform
+            transformed_tensor = self.transform(target_tensor)
+            return transformed_tensor, np.eye(4)
+
 
 def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_one',
-                       mag=0.8, train=True, vis=False, **kwargs):
+                       mag=0.8, train=True, vis=False, voxel_after_transf=True, **kwargs):
     """
     创建C3VD数据集的便捷函数
     
@@ -1495,31 +1562,36 @@ def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_
         mag: Ground Truth变换幅度
         train: 是否为训练模式
         vis: 是否返回可视化数据
+        voxel_after_transf: 是否在变换后进行体素化
         **kwargs: 其他配置参数
     
     Returns:
         C3VDDataset实例
     """
     # C3VD推荐的体素化配置
-    voxel_config = kwargs.get('voxel_config', {
+    default_voxel_config = {
         'voxel_size': 0.05,
         'voxel_grid_size': 32,
         'max_voxel_points': 100,
         'max_voxels': 20000,
         'min_voxel_points_ratio': 0.1
-    })
+    }
     
-    # 智能采样配置
-    sampling_config = kwargs.get('sampling_config', {
+    # C3VD推荐的采样配置
+    default_sampling_config = {
         'target_points': 1024,
         'intersection_priority': True,
         'min_intersection_ratio': 0.3,
         'max_intersection_ratio': 0.7
-    })
+    }
     
-    # Ground Truth变换（训练时）
+    # 合并用户配置
+    voxel_config = kwargs.get('voxel_config', default_voxel_config)
+    sampling_config = kwargs.get('sampling_config', default_sampling_config)
+    
+    # 创建Ground Truth变换
     transform = None
-    if train:
+    if train and mag > 0:
         transform = RandomTransformSE3(mag=mag, mag_randomly=True)
     
     return C3VDDataset(
@@ -1530,5 +1602,6 @@ def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_
         sampling_config=sampling_config,
         transform=transform,
         train=train,
-        vis=vis
+        vis=vis,
+        voxel_after_transf=voxel_after_transf
     )

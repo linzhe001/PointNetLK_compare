@@ -59,6 +59,16 @@ def parse_arguments():
     parser.add_argument('--c3vd-transform-mag', default=0.8, type=float,
                         help='C3VD Ground Truth变换幅度')
     
+    # C3VD场景划分参数
+    parser.add_argument('--c3vd-scene-split', action='store_true',
+                        help='启用C3VD场景划分')
+    parser.add_argument('--c3vd-split-ratio', default=0.8, type=float,
+                        help='C3VD训练集比例 (0.0-1.0)')
+    parser.add_argument('--c3vd-test-scenes', default='', type=str,
+                        help='C3VD指定测试场景列表（逗号分隔，可选）')
+    parser.add_argument('--c3vd-random-seed', default=42, type=int,
+                        help='C3VD场景划分随机种子')
+    
     # 体素化参数
     parser.add_argument('--voxel-size', default=0.05, type=float,
                         help='体素大小')
@@ -268,6 +278,21 @@ class UnifiedTrainer:
             'max_intersection_ratio': 0.7
         }
         
+        # 场景划分配置
+        scene_split_config = None
+        if self.args.c3vd_scene_split:
+            scene_split_config = {
+                'enable': True,
+                'split_ratio': self.args.c3vd_split_ratio,
+                'random_seed': self.args.c3vd_random_seed
+            }
+            
+            # 处理指定测试场景
+            if self.args.c3vd_test_scenes:
+                test_scenes = [s.strip() for s in self.args.c3vd_test_scenes.split(',')]
+                scene_split_config['test_scenes'] = test_scenes
+                LOGGER.info(f"指定测试场景: {test_scenes}")
+        
         # 创建训练集
         trainset = create_c3vd_dataset(
             source_root=source_root,
@@ -278,7 +303,8 @@ class UnifiedTrainer:
             vis=False,
             voxel_config=voxel_config,
             sampling_config=sampling_config,
-            voxel_after_transf=self.args.voxel_after_transf
+            voxel_after_transf=self.args.voxel_after_transf,
+            scene_split_config=scene_split_config
         )
         
         # 创建测试集（使用较小的变换幅度）
@@ -291,7 +317,8 @@ class UnifiedTrainer:
             vis=False,
             voxel_config=voxel_config,
             sampling_config=sampling_config,
-            voxel_after_transf=self.args.voxel_after_transf
+            voxel_after_transf=self.args.voxel_after_transf,
+            scene_split_config=scene_split_config
         )
         
         # 创建数据加载器
@@ -318,6 +345,10 @@ class UnifiedTrainer:
         LOGGER.info(f"目标点云路径: {target_root}")
         LOGGER.info(f"配对策略: {self.args.c3vd_pairing_strategy}, 变换幅度: {self.args.c3vd_transform_mag}")
         LOGGER.info(f"体素化配置: 网格大小={self.args.voxel_grid_size}, 体素大小={self.args.voxel_size}")
+        if scene_split_config:
+            LOGGER.info(f"场景划分: 启用, 比例={self.args.c3vd_split_ratio}")
+        else:
+            LOGGER.info("场景划分: 禁用")
         
         return train_loader, test_loader
     

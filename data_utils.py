@@ -866,11 +866,13 @@ class C3VDDataset(torch.utils.data.Dataset):
     """
     C3VD医学点云数据集
     支持多种配对策略和体素化处理
+    支持按场景划分训练测试集
     """
     
     def __init__(self, source_root, target_root=None, pairing_strategy='one_to_one',
                  voxel_config=None, sampling_config=None, transform=None, 
-                 train=True, vis=False, voxel_after_transf=True):
+                 train=True, vis=False, voxel_after_transf=True, 
+                 scene_split_config=None):
         """
         初始化C3VD数据集
         
@@ -883,7 +885,14 @@ class C3VDDataset(torch.utils.data.Dataset):
             transform: 数据变换（用于Ground Truth生成）
             train: 是否为训练模式
             vis: 是否返回可视化数据
-            voxel_after_transf: 是否在变换后进行体素化（True: 变换后体素化, False: 变换前体素化）
+            voxel_after_transf: 是否在变换后进行体素化
+            scene_split_config: 场景划分配置 {
+                'enable': bool,           # 是否启用场景划分
+                'split_ratio': float,     # 训练集比例 (0.0-1.0)
+                'split_method': str,      # 划分方法: 'random', 'anatomy_balanced', 'sequential'
+                'test_scenes': list,      # 指定测试场景列表（可选）
+                'random_seed': int        # 随机种子（可选）
+            }
         """
         self.source_root = Path(source_root)
         self.target_root = Path(target_root) if target_root else self.source_root / 'visible_point_cloud_ply_depth'
@@ -892,6 +901,9 @@ class C3VDDataset(torch.utils.data.Dataset):
         self.train = train
         self.vis = vis
         self.voxel_after_transf = voxel_after_transf
+        
+        # 场景划分配置
+        self.scene_split_config = scene_split_config or {'enable': False}
         
         # 默认体素化配置
         self.voxel_config = voxel_config or {
@@ -927,16 +939,21 @@ class C3VDDataset(torch.utils.data.Dataset):
         print(f"  配对策略: {self.pairing_strategy}")
         print(f"  数据对数量: {len(self.pairs)}")
         print(f"  训练模式: {self.train}")
+        print(f"  场景划分: {'启用' if self.scene_split_config.get('enable', False) else '禁用'}")
         print(f"  体素化时机: {'变换后' if self.voxel_after_transf else '变换前'}")
         print(f"  体素化配置: 网格大小={self.voxel_config['voxel_grid_size']}, 体素大小={self.voxel_config['voxel_size']}")
 
     def _load_pairs(self):
-        """根据配对策略加载点云对列表"""
+        """根据配对策略和场景划分配置加载点云对列表"""
         pairs = []
         
         # 扫描源目录获取所有场景
         source_scenes = self._scan_scenes(self.source_root)
         target_scenes = self._scan_scenes(self.target_root)
+        
+        # 如果启用场景划分，先进行场景筛选
+        if self.scene_split_config.get('enable', False):
+            source_scenes, target_scenes = self._apply_scene_split(source_scenes, target_scenes)
         
         if self.pairing_strategy == 'one_to_one':
             pairs = self._create_one_to_one_pairs(source_scenes, target_scenes)
@@ -954,6 +971,68 @@ class C3VDDataset(torch.utils.data.Dataset):
             raise ValueError(f"不支持的配对策略: {self.pairing_strategy}")
         
         return pairs
+    
+    def _apply_scene_split(self, source_scenes, target_scenes):
+        """应用场景划分，根据训练/测试模式返回对应的场景"""
+        all_scenes = set(source_scenes.keys()) & set(target_scenes.keys())
+        
+        if len(all_scenes) == 0:
+            print("警告: 没有找到匹配的场景")
+            return source_scenes, target_scenes
+        
+        # 获取训练和测试场景
+        train_scenes, test_scenes = self._split_scenes(list(all_scenes))
+        
+        # 根据当前模式选择场景
+        selected_scenes = train_scenes if self.train else test_scenes
+        
+        print(f"场景划分结果:")
+        print(f"  总场景数: {len(all_scenes)}")
+        print(f"  训练场景数: {len(train_scenes)}")
+        print(f"  测试场景数: {len(test_scenes)}")
+        print(f"  当前使用场景数: {len(selected_scenes)}")
+        if len(selected_scenes) <= 10:  # 只在场景数不多时显示详细列表
+            print(f"  当前场景: {sorted(selected_scenes)}")
+        
+        # 筛选场景
+        filtered_source_scenes = {k: v for k, v in source_scenes.items() if k in selected_scenes}
+        filtered_target_scenes = {k: v for k, v in target_scenes.items() if k in selected_scenes}
+        
+        return filtered_source_scenes, filtered_target_scenes
+    
+    def _split_scenes(self, all_scenes):
+        """将场景划分为训练集和测试集"""
+        config = self.scene_split_config
+        
+        # 如果指定了测试场景，直接使用
+        if 'test_scenes' in config and config['test_scenes']:
+            test_scenes = set(config['test_scenes']) & set(all_scenes)
+            train_scenes = set(all_scenes) - test_scenes
+            return list(train_scenes), list(test_scenes)
+        
+        # 获取划分比例和随机种子
+        split_ratio = config.get('split_ratio', 0.8)
+        random_seed = config.get('random_seed', 42)
+        
+        # 设置随机种子
+        import random
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        
+        # 使用随机划分
+        return self._random_split(all_scenes, split_ratio)
+    
+    def _random_split(self, all_scenes, split_ratio):
+        """随机划分场景"""
+        import random
+        scenes_list = list(all_scenes)
+        random.shuffle(scenes_list)
+        
+        split_point = int(len(scenes_list) * split_ratio)
+        train_scenes = scenes_list[:split_point]
+        test_scenes = scenes_list[split_point:]
+        
+        return train_scenes, test_scenes
     
     def _scan_scenes(self, root_path):
         """扫描目录获取所有场景和对应的PLY文件"""
@@ -1551,7 +1630,8 @@ class C3VDDataset(torch.utils.data.Dataset):
 
 
 def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_one',
-                       mag=0.8, train=True, vis=False, voxel_after_transf=True, **kwargs):
+                       mag=0.8, train=True, vis=False, voxel_after_transf=True, 
+                       scene_split_config=None, **kwargs):
     """
     创建C3VD数据集的便捷函数
     
@@ -1563,6 +1643,13 @@ def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_
         train: 是否为训练模式
         vis: 是否返回可视化数据
         voxel_after_transf: 是否在变换后进行体素化
+        scene_split_config: 场景划分配置 {
+            'enable': bool,           # 是否启用场景划分
+            'split_ratio': float,     # 训练集比例 (0.0-1.0)
+            'split_method': str,      # 划分方法: 'random', 'anatomy_balanced', 'sequential'
+            'test_scenes': list,      # 指定测试场景列表（可选）
+            'random_seed': int        # 随机种子（可选）
+        }
         **kwargs: 其他配置参数
     
     Returns:
@@ -1603,5 +1690,6 @@ def create_c3vd_dataset(source_root, target_root=None, pairing_strategy='one_to_
         transform=transform,
         train=train,
         vis=vis,
-        voxel_after_transf=voxel_after_transf
+        voxel_after_transf=voxel_after_transf,
+        scene_split_config=scene_split_config
     )

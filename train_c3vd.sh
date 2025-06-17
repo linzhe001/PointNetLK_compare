@@ -32,6 +32,10 @@ PointNetLK C3VD训练脚本
     --voxel-size            体素大小 (默认: 0.05)
     --voxel-after-transf    变换后体素化 (默认行为)
     --voxel-before-transf   变换前体素化 (新功能)
+    --scene-split           启用场景划分训练
+    --split-ratio           训练集比例 (默认: 0.8)
+    --random-seed           随机种子 (默认: 42)
+    --test-scenes           指定测试场景 (逗号分隔)
 
 体素化时机说明:
     --voxel-after-transf    先应用变换再体素化 (默认，适合标准训练)
@@ -50,6 +54,8 @@ PointNetLK C3VD训练脚本
     $0 --quick-test                             # 快速测试
     $0 --voxel-before-transf -t 1.0             # 使用变换前体素化，大变换幅度
     $0 --voxel-after-transf -t 0.5              # 使用变换后体素化，小变换幅度
+    $0 --scene-split --split-ratio 0.7
+    $0 --scene-split --test-scenes cecum_trial1_seq1,desc_trial2_seq3
 
 EOF
 }
@@ -65,8 +71,14 @@ OUTPUT_DIR="c3vd_results"
 GPU_ID=0
 NUM_POINTS=1024
 VOXEL_SIZE=4
-VOXEL_AFTER_TRANSF=true  # 默认为变换后体素化
+VOXEL_AFTER_TRANSF=false  # 默认为变换后体素化
 QUICK_TEST=false
+
+# 场景划分参数
+SCENE_SPLIT=false
+SPLIT_RATIO=0.8
+RANDOM_SEED=42
+TEST_SCENES=""
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -129,6 +141,25 @@ while [[ $# -gt 0 ]]; do
             BATCH_SIZE=4
             shift
             ;;
+        --scene-split)
+            SCENE_SPLIT=true
+            shift
+            ;;
+        --split-ratio)
+            SPLIT_RATIO="$2"
+            echo "设置划分比例: $SPLIT_RATIO"
+            shift 2
+            ;;
+        --random-seed)
+            RANDOM_SEED="$2"
+            echo "设置随机种子: $RANDOM_SEED"
+            shift 2
+            ;;
+        --test-scenes)
+            TEST_SCENES="$2"
+            echo "指定测试场景: $TEST_SCENES"
+            shift 2
+            ;;
         *)
             echo "[ERROR] 未知参数: $1"
             show_help
@@ -176,6 +207,10 @@ echo "点云点数: $NUM_POINTS"
 echo "体素大小: $VOXEL_SIZE"
 echo "体素化时机: $VOXEL_TIMING_DESC"
 echo "快速测试: $QUICK_TEST"
+echo "场景划分: $SCENE_SPLIT"
+echo "训练集比例: $SPLIT_RATIO"
+echo "随机种子: $RANDOM_SEED"
+echo "测试场景: $TEST_SCENES"
 echo "=================================="
 
 # 环境检查函数
@@ -280,6 +315,17 @@ train_model() {
         cmd="$cmd --voxel-after-transf"
     else
         cmd="$cmd --voxel-before-transf"
+    fi
+    
+    # 添加场景划分参数
+    if [[ "$SCENE_SPLIT" == "true" ]]; then
+        cmd="$cmd --c3vd-scene-split"
+        cmd="$cmd --c3vd-split-ratio $SPLIT_RATIO"
+        cmd="$cmd --c3vd-random-seed $RANDOM_SEED"
+        
+        if [[ -n "$TEST_SCENES" ]]; then
+            cmd="$cmd --c3vd-test-scenes $TEST_SCENES"
+        fi
     fi
     
     echo "[INFO] 执行训练命令..."

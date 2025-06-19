@@ -114,6 +114,31 @@ def parse_arguments():
     parser.add_argument('--benchmark-jacobian', action='store_true',
                         help='基准测试雅可比计算')
     
+    # 特征提取器设置
+    parser.add_argument('--feature-extractor', default='pointnet', 
+                        choices=['pointnet', 'attention', 'cformer', 'fast_attention', 'mamba3d'],
+                        help='特征提取器类型')
+    parser.add_argument('--feature-scale', default=1, type=int,
+                        help='特征提取器缩放因子')
+    
+    # 特征提取器特定参数
+    parser.add_argument('--attention-blocks', default=3, type=int,
+                        help='AttentionNet注意力块数量')
+    parser.add_argument('--attention-heads', default=8, type=int,
+                        help='AttentionNet注意力头数量')
+    parser.add_argument('--cformer-proxy-points', default=8, type=int,
+                        help='CFormer代理点数量')
+    parser.add_argument('--cformer-blocks', default=2, type=int,
+                        help='CFormer块数量')
+    parser.add_argument('--fast-attention-blocks', default=2, type=int,
+                        help='FastAttention块数量')
+    parser.add_argument('--mamba-blocks', default=3, type=int,
+                        help='Mamba3D块数量')
+    parser.add_argument('--mamba-d-state', default=16, type=int,
+                        help='Mamba3D状态维度')
+    parser.add_argument('--mamba-expand', default=2, type=int,
+                        help='Mamba3D扩展因子')
+    
     return parser.parse_args()
 
 
@@ -156,11 +181,48 @@ class UnifiedTester:
     
     def _create_single_model(self):
         """创建单个模型"""
-        LOGGER.info(f"创建 {self.args.model_type} 模型...")
+        LOGGER.info(f"创建 {self.args.model_type} 模型，特征提取器: {self.args.feature_extractor}...")
+        
+        # 准备特征提取器配置
+        feature_config = {
+            'dim_k': self.args.dim_k,
+            'scale': self.args.feature_scale
+        }
+        
+        # 根据特征提取器类型添加特定配置
+        if self.args.feature_extractor == 'attention':
+            feature_config.update({
+                'num_attention_blocks': self.args.attention_blocks,
+                'num_heads': self.args.attention_heads
+            })
+        elif self.args.feature_extractor == 'cformer':
+            feature_config.update({
+                'base_proxies': self.args.cformer_proxy_points,
+                'max_proxies': self.args.cformer_proxy_points * 8,
+                'num_blocks': self.args.cformer_blocks
+            })
+        elif self.args.feature_extractor == 'fast_attention':
+            feature_config.update({
+                'num_attention_blocks': self.args.fast_attention_blocks
+            })
+        elif self.args.feature_extractor == 'mamba3d':
+            feature_config.update({
+                'num_mamba_blocks': self.args.mamba_blocks,
+                'd_state': self.args.mamba_d_state,
+                'expand': self.args.mamba_expand
+            })
+        
+        # 使用UnifiedPointLK创建模型
+        from bridge.unified_pointlk import UnifiedPointLK
         
         # 创建模型
-        model_kwargs = {'dim_k': self.args.dim_k}
-        model = ModelBridge(self.args.model_type, **model_kwargs)
+        model = UnifiedPointLK(
+            pointlk_type=self.args.model_type,
+            feature_extractor_name=self.args.feature_extractor,
+            feature_config=feature_config,
+            device=self.device
+        )
+        
         model.to(self.device)
         
         # 加载权重
@@ -174,6 +236,7 @@ class UnifiedTester:
             model.load_state_dict(checkpoint)
         
         model.eval()
+        LOGGER.info(f"特征提取器: {self.args.feature_extractor}, 配置: {feature_config}")
         return model
     
     def _create_comparator(self):
@@ -360,8 +423,7 @@ class UnifiedTester:
                     r, g = self.model.forward(
                         p0, p1, 
                         maxiter=self.args.max_iter, 
-                        xtol=self.args.xtol,
-                        mode='test'
+                        xtol=self.args.xtol
                     )
                 
                 inference_time = time.time() - start_time

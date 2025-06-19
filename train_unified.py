@@ -29,6 +29,31 @@ def parse_arguments():
     parser.add_argument('--model-type', default='improved', choices=['original', 'improved'],
                         help='模型类型: original(原版) 或 improved(改进版)')
     
+    # 特征提取器设置
+    parser.add_argument('--feature-extractor', default='pointnet', 
+                        choices=['pointnet', 'attention', 'cformer', 'fast_attention', 'mamba3d'],
+                        help='特征提取器类型')
+    parser.add_argument('--feature-scale', default=1, type=int,
+                        help='特征提取器缩放因子')
+    
+    # 特征提取器特定参数
+    parser.add_argument('--attention-blocks', default=3, type=int,
+                        help='AttentionNet注意力块数量')
+    parser.add_argument('--attention-heads', default=8, type=int,
+                        help='AttentionNet注意力头数量')
+    parser.add_argument('--cformer-proxy-points', default=8, type=int,
+                        help='CFormer代理点数量')
+    parser.add_argument('--cformer-blocks', default=2, type=int,
+                        help='CFormer块数量')
+    parser.add_argument('--fast-attention-blocks', default=2, type=int,
+                        help='FastAttention块数量')
+    parser.add_argument('--mamba-blocks', default=3, type=int,
+                        help='Mamba3D块数量')
+    parser.add_argument('--mamba-d-state', default=16, type=int,
+                        help='Mamba3D状态维度')
+    parser.add_argument('--mamba-expand', default=2, type=int,
+                        help='Mamba3D扩展因子')
+    
     # 必需参数
     parser.add_argument('-o', '--outfile', required=True, type=str,
                         help='输出文件前缀')
@@ -174,10 +199,42 @@ class UnifiedTrainer:
     
     def _create_model(self):
         """创建模型"""
-        LOGGER.info(f"创建 {self.args.model_type} 模型...")
+        LOGGER.info(f"创建 {self.args.model_type} 模型，特征提取器: {self.args.feature_extractor}...")
+        
+        # 准备特征提取器配置
+        feature_config = {
+            'dim_k': self.args.dim_k,
+            'scale': self.args.feature_scale
+        }
+        
+        # 根据特征提取器类型添加特定配置
+        if self.args.feature_extractor == 'attention':
+            feature_config.update({
+                'num_attention_blocks': self.args.attention_blocks,
+                'num_heads': self.args.attention_heads
+            })
+        elif self.args.feature_extractor == 'cformer':
+            feature_config.update({
+                'base_proxies': self.args.cformer_proxy_points,
+                'max_proxies': self.args.cformer_proxy_points * 8,
+                'num_blocks': self.args.cformer_blocks
+            })
+        elif self.args.feature_extractor == 'fast_attention':
+            feature_config.update({
+                'num_attention_blocks': self.args.fast_attention_blocks
+            })
+        elif self.args.feature_extractor == 'mamba3d':
+            feature_config.update({
+                'num_mamba_blocks': self.args.mamba_blocks,
+                'd_state': self.args.mamba_d_state,
+                'expand': self.args.mamba_expand
+            })
+        
+        # 使用UnifiedPointLK创建模型
+        from bridge.unified_pointlk import UnifiedPointLK
         
         model_kwargs = {
-            'dim_k': self.args.dim_k,
+            'device': self.device
         }
         
         if self.args.model_type == 'original':
@@ -186,10 +243,17 @@ class UnifiedTrainer:
                 'learn_delta': self.args.learn_delta,
             })
         
-        model = ModelBridge(self.args.model_type, **model_kwargs)
+        model = UnifiedPointLK(
+            pointlk_type=self.args.model_type,
+            feature_extractor_name=self.args.feature_extractor,
+            feature_config=feature_config,
+            **model_kwargs
+        )
+        
         model.to(self.device)
         
         LOGGER.info(f"模型已创建并移动到 {self.device}")
+        LOGGER.info(f"特征提取器: {self.args.feature_extractor}, 配置: {feature_config}")
         return model
     
     def _create_data_loaders(self):
@@ -378,6 +442,74 @@ class UnifiedTrainer:
             LOGGER.info(f"加载预训练模型: {self.args.pretrained}")
             self.model.load_state_dict(torch.load(self.args.pretrained, map_location=self.device))
     
+    def _compute_loss_safely(self, r, g, igt, batch_idx, is_training=True):
+        """
+        安全计算损失，对None值使用惩罚值而非忽略
+        
+        Args:
+            r: 残差
+            g: 变换矩阵估计
+            igt: 真实变换矩阵
+            batch_idx: 批次索引
+            is_training: 是否在训练阶段
+            
+        Returns:
+            tuple: (loss_r, loss_g, total_loss)
+        """
+        # 定义惩罚值
+        penalty_value = 100.0
+        
+        # 计算残差损失
+        if r is not None:
+            loss_r = self.model.rsq(r)
+        else:
+            loss_r = torch.tensor(penalty_value, device=self.device, requires_grad=True)
+            phase = "训练" if is_training else "验证"
+            LOGGER.warning(f"{phase} Batch {batch_idx}: 模型收敛失败，r为None，使用惩罚值 {penalty_value}")
+        
+        # 计算变换损失
+        if g is not None:
+            loss_g = self.model.comp(g, igt)
+        else:
+            loss_g = torch.tensor(penalty_value, device=self.device, requires_grad=True)
+            phase = "训练" if is_training else "验证"
+            LOGGER.warning(f"{phase} Batch {batch_idx}: 模型收敛失败，g为None，使用惩罚值 {penalty_value}")
+        
+        # 计算总损失
+        total_loss = loss_r + loss_g
+        
+        return loss_r, loss_g, total_loss
+    
+    def _validate_loss(self, loss, batch_idx, is_training=True):
+        """
+        验证损失值的有效性
+        
+        Args:
+            loss: 损失值
+            batch_idx: 批次索引
+            is_training: 是否在训练阶段
+            
+        Returns:
+            bool: 损失是否有效
+        """
+        phase = "训练" if is_training else "验证"
+        
+        # 检查NaN
+        if torch.isnan(loss):
+            LOGGER.error(f"{phase} Batch {batch_idx}: 检测到 NaN loss")
+            return False
+        
+        # 检查无穷大
+        if torch.isinf(loss):
+            LOGGER.error(f"{phase} Batch {batch_idx}: 检测到 Inf loss")
+            return False
+        
+        # 检查异常大的损失值
+        if loss.item() > 1000.0:
+            LOGGER.warning(f"{phase} Batch {batch_idx}: 检测到异常大的loss值: {loss.item():.6f}")
+        
+        return True
+
     def train_epoch(self, epoch):
         """训练一个epoch"""
         self.model.train()
@@ -385,6 +517,7 @@ class UnifiedTrainer:
         total_loss = 0.0
         total_samples = 0
         start_time = time.time()
+        skipped_batches = 0
         
         for batch_idx, data in enumerate(self.train_loader):
             # 解析数据
@@ -400,10 +533,33 @@ class UnifiedTrainer:
             
             # 前向传播
             self.optimizer.zero_grad()
-            loss = self.model.compute_loss(p0, p1, igt, maxiter=self.args.max_iter)
+            
+            # 使用UnifiedPointLK的统一接口
+            if self.args.model_type == 'original':
+                r, g = self.model.forward(p0, p1, maxiter=self.args.max_iter)
+                loss_r, loss_g, loss = self._compute_loss_safely(r, g, igt, batch_idx, is_training=True)
+            else:
+                # 改进版需要启用梯度计算
+                p0.requires_grad_(True)
+                p1.requires_grad_(True)
+                with torch.enable_grad():
+                    r, g = self.model.forward(p0, p1, maxiter=self.args.max_iter, mode='train')
+                    loss_r, loss_g, loss = self._compute_loss_safely(r, g, igt, batch_idx, is_training=True)
+            
+            # 验证损失有效性
+            if not self._validate_loss(loss, batch_idx, is_training=True):
+                skipped_batches += 1
+                if skipped_batches > 10:  # 如果连续跳过太多批次，停止训练
+                    LOGGER.error(f"连续跳过 {skipped_batches} 个批次，停止当前epoch训练")
+                    break
+                continue
             
             # 反向传播
             loss.backward()
+            
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
             self.optimizer.step()
             
             # 统计
@@ -414,10 +570,13 @@ class UnifiedTrainer:
             if batch_idx % self.args.log_interval == 0:
                 LOGGER.info(f'训练 Epoch: {epoch} [{batch_idx * len(p0)}/{len(self.train_loader.dataset)} '
                            f'({100. * batch_idx / len(self.train_loader):.0f}%)]\\t'
-                           f'Loss: {loss.item():.6f}')
+                           f'Loss: {loss.item():.6f} (r: {loss_r.item():.6f}, g: {loss_g.item():.6f})')
         
-        avg_loss = total_loss / len(self.train_loader)
+        avg_loss = total_loss / max(len(self.train_loader) - skipped_batches, 1)
         epoch_time = time.time() - start_time
+        
+        if skipped_batches > 0:
+            LOGGER.warning(f'训练 Epoch: {epoch}, 跳过批次数: {skipped_batches}')
         
         LOGGER.info(f'训练 Epoch: {epoch}, 平均损失: {avg_loss:.6f}, 时间: {epoch_time:.2f}s')
         return avg_loss
@@ -431,6 +590,8 @@ class UnifiedTrainer:
         self.model.eval()
         val_loss = 0.0
         num_examples = 0
+        skipped_batches = 0
+        max_eval_batches = 50  # 增加验证批次数量
         
         with torch.no_grad():
             for batch_idx, data in enumerate(self.val_loader):
@@ -449,20 +610,29 @@ class UnifiedTrainer:
                 
                 # 前向传播
                 if self.args.model_type == 'original':
-                    r, t = self.model(p0, p1)
-                    loss = self.model.compute_loss(r, t, igt, maxiter=self.args.max_iter)
+                    r, g = self.model.forward(p0, p1, maxiter=self.args.max_iter)
+                    loss_r, loss_g, loss = self._compute_loss_safely(r, g, igt, batch_idx, is_training=False)
                 else:
-                    loss = self.model.compute_loss(p0, p1, igt, maxiter=self.args.max_iter)
+                    r, g = self.model.forward(p0, p1, maxiter=self.args.max_iter, mode='test')
+                    loss_r, loss_g, loss = self._compute_loss_safely(r, g, igt, batch_idx, is_training=False)
+                
+                # 验证损失有效性
+                if not self._validate_loss(loss, batch_idx, is_training=False):
+                    skipped_batches += 1
+                    continue
                 
                 val_loss += loss.item()
                 num_examples += p0.size(0)
                 
                 # 限制验证批次数量，避免过长时间
-                if batch_idx >= 10:  # 只验证前10个批次
+                if batch_idx >= max_eval_batches:
                     break
         
+        if skipped_batches > 0:
+            LOGGER.warning(f'验证 Epoch: {epoch}, 跳过批次数: {skipped_batches}')
+        
         avg_val_loss = val_loss / max(num_examples, 1)
-        LOGGER.info(f'验证 Epoch: {epoch}, 平均损失: {avg_val_loss:.6f}')
+        LOGGER.info(f'验证 Epoch: {epoch}, 平均损失: {avg_val_loss:.6f}, 处理样本数: {num_examples}')
         
         return avg_val_loss
     

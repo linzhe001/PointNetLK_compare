@@ -129,3 +129,13 @@ dmypy.json
 .pyre/
 
 .vscode
+
+# PyTorch模型文件
+*.pth
+*.pt
+
+# 机器学习相关文件
+*.pkl
+*.pickle
+*.h5
+*.hdf5

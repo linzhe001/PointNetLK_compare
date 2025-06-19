@@ -21,6 +21,7 @@ PointNetLK C3VD训练脚本
     -h, --help              显示此帮助信息
     -d, --dataset-path      C3VD数据集路径 (默认: /mnt/f/Datasets/C3VD_sever_datasets)
     -m, --model-type        模型类型: original|improved (默认: improved)
+    -f, --feature-extractor 特征提取器: pointnet|attention|cformer|fast_attention|mamba3d (默认: pointnet)
     -e, --epochs            训练轮数 (默认: 10)
     -b, --batch-size        批次大小 (默认: 8)
     -s, --pairing-strategy  配对策略 (默认: one_to_one)
@@ -32,10 +33,18 @@ PointNetLK C3VD训练脚本
     --voxel-size            体素大小 (默认: 0.05)
     --voxel-after-transf    变换后体素化 (默认行为)
     --voxel-before-transf   变换前体素化 (新功能)
-    --scene-split           启用场景划分训练
+    --scene-split           启用场景划分训练 (默认启用)
+    --no-scene-split        禁用场景划分训练
     --split-ratio           训练集比例 (默认: 0.8)
     --random-seed           随机种子 (默认: 42)
     --test-scenes           指定测试场景 (逗号分隔)
+
+特征提取器说明:
+    pointnet                原始PointNet特征提取器 (默认)
+    attention               基于注意力机制的特征提取器
+    cformer                 基于收集分发机制的Transformer
+    fast_attention          轻量级注意力特征提取器
+    mamba3d                 基于状态空间模型的特征提取器
 
 体素化时机说明:
     --voxel-after-transf    先应用变换再体素化 (默认，适合标准训练)
@@ -49,33 +58,36 @@ PointNetLK C3VD训练脚本
     all                     全部配对
 
 示例:
-    $0                                          # 使用默认参数训练
+    $0                                          # 使用默认参数训练（启用场景划分，比例0.8）
     $0 -m original -e 50 -b 4                  # 训练原始版模型50轮
+    $0 -f cformer -e 5 -b 4                    # 使用CFormer特征提取器训练5轮
     $0 --quick-test                             # 快速测试
     $0 --voxel-before-transf -t 1.0             # 使用变换前体素化，大变换幅度
     $0 --voxel-after-transf -t 0.5              # 使用变换后体素化，小变换幅度
-    $0 --scene-split --split-ratio 0.7
-    $0 --scene-split --test-scenes cecum_trial1_seq1,desc_trial2_seq3
+    $0 --split-ratio 0.7                       # 修改训练集比例为0.7
+    $0 --no-scene-split                        # 禁用场景划分（使用全部数据）
+    $0 --test-scenes cecum_trial1_seq1,desc_trial2_seq3  # 指定特定测试场景
 
 EOF
 }
 
 # 默认参数
 DATASET_PATH="/mnt/f/Datasets/C3VD_sever_datasets"
-MODEL_TYPE="improved"
-EPOCHS=10
-BATCH_SIZE=8
+MODEL_TYPE="original"
+FEATURE_EXTRACTOR="cformer"
+EPOCHS=100
+BATCH_SIZE=16
 PAIRING_STRATEGY="one_to_one"
 TRANSFORM_MAG=0.8
 OUTPUT_DIR="c3vd_results"
 GPU_ID=0
 NUM_POINTS=1024
 VOXEL_SIZE=4
-VOXEL_AFTER_TRANSF=false  # 默认为变换后体素化
+VOXEL_AFTER_TRANSF=false  # 默认为变换前体素化
 QUICK_TEST=false
 
-# 场景划分参数
-SCENE_SPLIT=false
+# 场景划分参数 - 默认启用场景划分
+SCENE_SPLIT=true
 SPLIT_RATIO=0.8
 RANDOM_SEED=42
 TEST_SCENES=""
@@ -93,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--model-type)
             MODEL_TYPE="$2"
+            shift 2
+            ;;
+        -f|--feature-extractor)
+            FEATURE_EXTRACTOR="$2"
             shift 2
             ;;
         -e|--epochs)
@@ -145,6 +161,10 @@ while [[ $# -gt 0 ]]; do
             SCENE_SPLIT=true
             shift
             ;;
+        --no-scene-split)
+            SCENE_SPLIT=false
+            shift
+            ;;
         --split-ratio)
             SPLIT_RATIO="$2"
             echo "设置划分比例: $SPLIT_RATIO"
@@ -174,6 +194,12 @@ if [[ ! "$MODEL_TYPE" =~ ^(original|improved)$ ]]; then
     exit 1
 fi
 
+# 验证特征提取器类型
+if [[ ! "$FEATURE_EXTRACTOR" =~ ^(pointnet|attention|cformer|fast_attention|mamba3d)$ ]]; then
+    echo "[ERROR] 无效的特征提取器类型: $FEATURE_EXTRACTOR. 必须是 pointnet, attention, cformer, fast_attention 或 mamba3d"
+    exit 1
+fi
+
 # 验证配对策略
 if [[ ! "$PAIRING_STRATEGY" =~ ^(one_to_one|scene_reference|source_to_source|target_to_target|all)$ ]]; then
     echo "[ERROR] 无效的配对策略: $PAIRING_STRATEGY"
@@ -197,6 +223,7 @@ fi
 echo "[INFO] === PointNetLK C3VD训练配置 ==="
 echo "数据集路径: $DATASET_PATH"
 echo "模型类型: $MODEL_TYPE"
+echo "特征提取器: $FEATURE_EXTRACTOR"
 echo "训练轮数: $EPOCHS"
 echo "批次大小: $BATCH_SIZE"
 echo "配对策略: $PAIRING_STRATEGY"
@@ -279,17 +306,31 @@ check_dataset() {
 # 创建输出目录
 create_output_dir() {
     echo "[INFO] 创建输出目录..."
-    mkdir -p "$OUTPUT_DIR"
-    mkdir -p "$OUTPUT_DIR/logs"
-    mkdir -p "$OUTPUT_DIR/models"
+    
+    # 创建按特征提取器和模型类型组织的子目录
+    local sub_dir="${FEATURE_EXTRACTOR}_${MODEL_TYPE}"
+    local full_output_dir="$OUTPUT_DIR/$sub_dir"
+    
+    mkdir -p "$full_output_dir"
+    mkdir -p "$full_output_dir/logs"
+    mkdir -p "$full_output_dir/models"
+    mkdir -p "$full_output_dir/test_results"
+    mkdir -p "$full_output_dir/reports"
+    
+    # 更新OUTPUT_DIR变量为完整路径
+    OUTPUT_DIR="$full_output_dir"
+    
     echo "[INFO] 输出目录创建完成: $OUTPUT_DIR"
+    echo "[INFO] 目录结构: ${FEATURE_EXTRACTOR}_${MODEL_TYPE}/[logs|models|test_results|reports]"
 }
 
 # 训练模型
 train_model() {
-    local output_prefix="$OUTPUT_DIR/${MODEL_TYPE}_$(date +%Y%m%d_%H%M%S)"
+    local output_prefix="$OUTPUT_DIR/models/${MODEL_TYPE}_$(date +%Y%m%d_%H%M%S)"
     
     echo "[INFO] 开始训练 $MODEL_TYPE 模型..."
+    echo "[INFO] 使用特征提取器: $FEATURE_EXTRACTOR"
+    echo "[INFO] 结果将保存到: $OUTPUT_DIR"
     
     # 构建基础训练命令
     local cmd="python train_unified.py \
@@ -297,6 +338,7 @@ train_model() {
         --dataset-path $DATASET_PATH \
         --outfile $output_prefix \
         --model-type $MODEL_TYPE \
+        --feature-extractor $FEATURE_EXTRACTOR \
         --c3vd-pairing-strategy $PAIRING_STRATEGY \
         --c3vd-transform-mag $TRANSFORM_MAG \
         --epochs $EPOCHS \
@@ -304,7 +346,7 @@ train_model() {
         --num-points $NUM_POINTS \
         --device cuda:$GPU_ID \
         --voxel-size $VOXEL_SIZE \
-        --learning-rate 0.001 \
+        --learning-rate 0.0001 \
         --workers 4 \
         --save-interval 10 \
         --log-interval 10 \
@@ -340,14 +382,18 @@ train_model() {
         local duration=$((end_time - start_time))
         echo "[SUCCESS] $MODEL_TYPE 模型训练完成，用时 ${duration}秒"
         
-        # 保存训练信息
-        echo "模型类型: $MODEL_TYPE" > "$output_prefix.info"
-        echo "训练时间: $(date)" >> "$output_prefix.info"
-        echo "训练用时: ${duration}秒" >> "$output_prefix.info"
-        echo "数据集: $DATASET_PATH" >> "$output_prefix.info"
-        echo "配对策略: $PAIRING_STRATEGY" >> "$output_prefix.info"
-        echo "变换幅度: $TRANSFORM_MAG" >> "$output_prefix.info"
-        echo "体素化时机: $VOXEL_TIMING_DESC" >> "$output_prefix.info"
+        # 保存训练信息到reports目录
+        local info_file="$OUTPUT_DIR/reports/training_info_$(date +%Y%m%d_%H%M%S).txt"
+        echo "模型类型: $MODEL_TYPE" > "$info_file"
+        echo "特征提取器: $FEATURE_EXTRACTOR" >> "$info_file"
+        echo "训练时间: $(date)" >> "$info_file"
+        echo "训练用时: ${duration}秒" >> "$info_file"
+        echo "数据集: $DATASET_PATH" >> "$info_file"
+        echo "配对策略: $PAIRING_STRATEGY" >> "$info_file"
+        echo "变换幅度: $TRANSFORM_MAG" >> "$info_file"
+        echo "体素化时机: $VOXEL_TIMING_DESC" >> "$info_file"
+        echo "场景划分: $SCENE_SPLIT" >> "$info_file"
+        echo "训练集比例: $SPLIT_RATIO" >> "$info_file"
         
         # 保存模型路径供测试使用
         echo "$output_prefix" > "$OUTPUT_DIR/latest_model_path.txt"
@@ -378,9 +424,10 @@ run_test() {
     fi
     
     echo "[INFO] 运行模型测试: $MODEL_TYPE"
+    echo "[INFO] 使用特征提取器: $FEATURE_EXTRACTOR"
     echo "[INFO] 测试体素化时机: $VOXEL_TIMING_DESC"
     
-    local test_output="$OUTPUT_DIR/test_$(date +%Y%m%d_%H%M%S)"
+    local test_output="$OUTPUT_DIR/test_results/test_$(date +%Y%m%d_%H%M%S)"
     
     # 构建测试命令
     local test_cmd="python test_unified.py \
@@ -390,6 +437,7 @@ run_test() {
         --model-path $model_path \
         --outfile $test_output \
         --model-type $MODEL_TYPE \
+        --feature-extractor $FEATURE_EXTRACTOR \
         --c3vd-pairing-strategy $PAIRING_STRATEGY \
         --c3vd-test-transform-mags 0.2,0.4,0.6,0.8 \
         --batch-size 4 \
@@ -407,16 +455,19 @@ run_test() {
         test_cmd="$test_cmd --voxel-before-transf"
     fi
     
-    eval "$test_cmd"
-    
-    echo "[SUCCESS] 测试完成"
+    if eval "$test_cmd"; then
+        echo "[SUCCESS] 测试完成，结果保存到: $test_output"
+    else
+        echo "[ERROR] 测试失败"
+        return 1
+    fi
 }
 
 # 生成训练报告
 generate_report() {
     echo "[INFO] 生成训练报告..."
     
-    local report_file="$OUTPUT_DIR/training_report_$(date +%Y%m%d_%H%M%S).txt"
+    local report_file="$OUTPUT_DIR/reports/training_report_$(date +%Y%m%d_%H%M%S).txt"
     
     cat > "$report_file" << EOF
 === PointNetLK C3VD训练报告 ===
@@ -425,6 +476,7 @@ generate_report() {
 训练配置:
 - 数据集路径: $DATASET_PATH
 - 模型类型: $MODEL_TYPE
+- 特征提取器: $FEATURE_EXTRACTOR
 - 训练轮数: $EPOCHS
 - 批次大小: $BATCH_SIZE
 - 配对策略: $PAIRING_STRATEGY
@@ -434,12 +486,14 @@ generate_report() {
 - 点云点数: $NUM_POINTS
 - 体素大小: $VOXEL_SIZE
 - 体素化时机: $VOXEL_TIMING_DESC
+- 场景划分: $SCENE_SPLIT
+- 训练集比例: $SPLIT_RATIO
 
 训练结果:
 EOF
     
     # 添加训练日志摘要
-    find "$OUTPUT_DIR" -name "*.log" -type f | while read -r log_file; do
+    find "$OUTPUT_DIR/logs" -name "*.log" -type f 2>/dev/null | while read -r log_file; do
         if [[ -f "$log_file" ]]; then
             echo "--- $(basename "$log_file") ---" >> "$report_file"
             tail -10 "$log_file" >> "$report_file"
@@ -449,18 +503,22 @@ EOF
     
     # 添加模型文件信息
     echo "生成的模型文件:" >> "$report_file"
-    find "$OUTPUT_DIR" -name "*.pth" -type f -exec ls -lh {} \; >> "$report_file"
+    find "$OUTPUT_DIR/models" -name "*.pth" -type f 2>/dev/null -exec ls -lh {} \; >> "$report_file"
     
     # 添加测试结果
     echo "" >> "$report_file"
     echo "测试结果:" >> "$report_file"
-    find "$OUTPUT_DIR" -name "*test*" -type d | while read -r test_dir; do
-        if [[ -d "$test_dir" ]]; then
-            echo "--- $(basename "$test_dir") ---" >> "$report_file"
-            find "$test_dir" -name "*.txt" -type f | head -1 | xargs cat >> "$report_file" 2>/dev/null || echo "无测试结果文件" >> "$report_file"
+    find "$OUTPUT_DIR/test_results" -name "*.txt" -type f 2>/dev/null | head -5 | while read -r test_file; do
+        if [[ -f "$test_file" ]]; then
+            echo "--- $(basename "$test_file") ---" >> "$report_file"
+            head -20 "$test_file" >> "$report_file" 2>/dev/null || echo "无法读取测试结果文件" >> "$report_file"
             echo "" >> "$report_file"
         fi
     done
+    
+    if [[ ! -d "$OUTPUT_DIR/test_results" ]] || [[ -z "$(find "$OUTPUT_DIR/test_results" -name "*.txt" -type f 2>/dev/null)" ]]; then
+        echo "无测试结果文件" >> "$report_file"
+    fi
     
     echo "[SUCCESS] 训练报告已生成: $report_file"
 }

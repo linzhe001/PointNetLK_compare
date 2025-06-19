@@ -1,0 +1,10 @@
+模型类型: original
+特征提取器: cformer
+训练时间: Wed Jun 18 20:36:29 BST 2025
+训练用时: 1959秒
+数据集: /mnt/f/Datasets/C3VD_sever_datasets
+配对策略: one_to_one
+变换幅度: 0.8
+体素化时机: 变换前体素化
+场景划分: true
+训练集比例: 0.8
